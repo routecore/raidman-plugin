@@ -1,0 +1,130 @@
+Menu="Utilities"
+Title="RaidMan"
+Icon="icon.png"
+Focus="initDropdown"
+---
+<?php
+$plugin = "RaidMan";
+$settings_file = "/boot/config/plugins/raidman/settings.json";
+
+// Default settings
+$defaults = [
+    "host_terminal_enabled" => true,
+    "restrict_api_keys" => false,
+    "allowed_api_keys" => []
+];
+
+// Load settings
+$settings = $defaults;
+if (file_exists($settings_file)) {
+    $loaded = json_decode(file_get_contents($settings_file), true);
+    if ($loaded) {
+        $settings = array_merge($defaults, $loaded);
+    }
+}
+
+// Load available keys
+$keys_dir = "/boot/config/plugins/dynamix.my.servers/keys";
+$available_keys = [];
+if (is_dir($keys_dir)) {
+    foreach (glob("$keys_dir/*.json") as $file) {
+        $content = json_decode(file_get_contents($file), true);
+        if ($content && isset($content['key'])) {
+            // Use name or default to filename if missing
+            $name = $content['name'] ?? basename($file, ".json");
+            $available_keys[$content['key']] = $name;
+        }
+    }
+}
+
+// Save settings
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // "true" string from select comes as string, need conversion
+    $settings['host_terminal_enabled'] = $_POST['host_terminal_enabled'] === "true";
+    $settings['restrict_api_keys'] = $_POST['restrict_api_keys'] === "true";
+    
+    $settings['allowed_api_keys'] = [];
+    if (isset($_POST['allowed_api_keys']) && is_array($_POST['allowed_api_keys'])) {
+        $settings['allowed_api_keys'] = array_values($_POST['allowed_api_keys']);
+    }
+
+    file_put_contents($settings_file, json_encode($settings, JSON_PRETTY_PRINT));
+    echo "<div class='updated'>Settings saved.</div>";
+}
+?>
+
+<form markdown="1" method="post" action="/Settings/raidman">
+
+### Settings
+
+Host Terminal Access:
+: <select name="host_terminal_enabled" size="1">
+    <option value="true" <?= $settings['host_terminal_enabled'] ? 'selected' : '' ?>>Enabled</option>
+    <option value="false" <?= !$settings['host_terminal_enabled'] ? 'selected' : '' ?>>Disabled</option>
+  </select>
+  _Enable access to the Host Terminal via RaidMan._
+
+Restrict to Specific API Keys:
+: <select name="restrict_api_keys" id="restrict_api_keys" size="1" onchange="toggleKeyList()">
+    <option value="false" <?= !$settings['restrict_api_keys'] ? 'selected' : '' ?>>No (Allow All)</option>
+    <option value="true" <?= $settings['restrict_api_keys'] ? 'selected' : '' ?>>Yes (Restrict)</option>
+  </select>
+  _If enabled, only selected API keys below will be able to connect._
+
+
+
+Allowed API Keys:
+: <select id="slot_1" name="allowed_api_keys[]" multiple="multiple" style="display:none">
+    <?php foreach ($available_keys as $key => $name): ?>
+    <option value="<?= $key ?>" <?= in_array($key, $settings['allowed_api_keys']) ? 'selected' : '' ?>><?= $name ?></option>
+    <?php endforeach; ?>
+  </select>
+  _Select the API keys that are allowed to access the plugin._
+
+<br>
+<input type="submit" value="Apply">
+
+</form>
+
+<script>
+var openPage = true;
+
+<? if (!$tabbed): ?>
+$(function(){initDropdown();});
+<? else: ?>
+$(function(){
+  if ( $('#tab3').attr('checked') ) initDropdown();
+});
+<? endif; ?>
+
+function initDropdown() {
+  if (openPage) {
+    $("#slot_1").dropdownchecklist({width:290, explicitClose:'..._(close)_'});
+    openPage = false;
+  }
+}
+
+function toggleKeyList() {
+    var select = document.getElementById('restrict_api_keys');
+    var slot1 = document.getElementById('slot_1');
+    // The dropdownchecklist plugin hides the original select and creates a new structure.
+    // We need to find the generated container. It's usually inserted after the select.
+    // However, for simplicity in Unraid settings, we can often just control the parent DD.
+    
+    var dd = $('#slot_1').closest('dd');
+    var dt = dd.prev('dt');
+    
+    if (select.value === "true") {
+        dd.show();
+        dt.show();
+    } else {
+        dd.hide();
+        dt.hide();
+    }
+}
+
+$(function() {
+    // Initial state check
+    toggleKeyList();
+});
+</script>

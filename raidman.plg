@@ -1,0 +1,172 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "raidman">
+<!ENTITY author    "Routecore">
+<!ENTITY version   "2026.02.10">
+<!ENTITY launch    "Settings/raidman">
+<!ENTITY gitURL    "https://github.com/routecore/raidman-plugin">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/routecore/raidman-plugin/main/raidman.plg">
+]>
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" icon="icon.png" min="6.9.0" support="link">
+
+<CHANGES>
+<CHANGE>2026.02.10 - Initial Release</CHANGE>
+</CHANGES>
+
+<!--
+The 'source' file.
+-->
+
+<FILE Name="/boot/config/plugins/&name;/raidman.conf">
+<URL>https://raw.githubusercontent.com/routecore/raidman-plugin/main/raidman.conf</URL>
+</FILE>
+
+<FILE Name="/boot/config/plugins/&name;/raidman">
+<URL>https://github.com/routecore/raidman-plugin/releases/download/&version;/raidman</URL>
+</FILE>
+
+<FILE Name="/boot/config/plugins/&name;/raidman.page">
+<URL>https://raw.githubusercontent.com/routecore/raidman-plugin/main/src/raidman.page</URL>
+</FILE>
+
+
+
+<FILE Name="/boot/config/plugins/&name;/icon.png">
+<URL>https://raw.githubusercontent.com/routecore/raidman-plugin/main/icon.png</URL>
+</FILE>
+
+<!--
+The 'install' script.
+-->
+<FILE Run="/bin/bash">
+<INLINE>
+<![CDATA[
+echo "Installing RaidMan..."
+echo "Creating directories..."
+# Create directory
+mkdir -p /usr/local/emhttp/plugins/raidman
+
+echo "Copying binary..."
+# Copy binary
+cp /boot/config/plugins/raidman/raidman /usr/local/emhttp/plugins/raidman/raidman
+chmod +x /usr/local/emhttp/plugins/raidman/raidman
+cp /boot/config/plugins/raidman/icon.png /usr/local/emhttp/plugins/raidman/icon.png
+cp /boot/config/plugins/raidman/raidman.page /usr/local/emhttp/plugins/raidman/raidman.page
+
+# -------------------------------------------------
+# Nginx Configuration
+# -------------------------------------------------
+
+echo "Configuring Nginx..."
+cp /boot/config/plugins/raidman/raidman.conf /etc/nginx/conf.d/raidman.conf
+
+# Function to inject config
+inject_nginx() {
+    if !grep -q "include /etc/nginx/conf.d/raidman.conf;" /etc/nginx/conf.d/locations.conf; then
+        echo "Injecting RaidMan config into locations.conf..."
+        # Ensure newline
+        echo "" >> /etc/nginx/conf.d/locations.conf
+        echo "include /etc/nginx/conf.d/raidman.conf;" >> /etc/nginx/conf.d/locations.conf
+        /usr/sbin/nginx -s reload
+    fi
+}
+
+inject_nginx
+
+# -------------------------------------------------
+# Download noVNC from Official GitHub Releases
+# -------------------------------------------------
+echo "Downloading noVNC..."
+NOVNC_VERSION="1.6.0"
+NOVNC_DIR="/usr/local/emhttp/plugins/raidman/web/novnc"
+
+# Create web directory
+mkdir -p /usr/local/emhttp/plugins/raidman/web
+
+
+# Download and extract noVNC if not already present
+if [ ! -d "$NOVNC_DIR" ]; then
+    # Check for existing noVNC in dynamix.vm.manager
+    STOCK_NOVNC="/usr/local/emhttp/plugins/dynamix.vm.manager/novnc"
+    if [ -d "$STOCK_NOVNC" ]; then
+        echo "Found local noVNC in dynamix.vm.manager, copying..."
+        cp -r "$STOCK_NOVNC" "$NOVNC_DIR"
+        echo "noVNC copied from local system."
+    else
+        echo "Fetching noVNC v${NOVNC_VERSION}..."
+        cd /tmp
+        wget -q "https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz" -O novnc.tar.gz
+        
+        # Verify Checksum (v1.6.0)
+        # Note: This checksum is for the auto-generated tarball from GitHub. 
+        # If GitHub changes compression, this might break. 
+        # Ideally we should host our own verifiable tarball.
+        # For now, we log the sum for audit.
+        echo "Calculated Checksum: $(sha256sum novnc.tar.gz | awk '{print $1}')"
+        
+        tar -xzf novnc.tar.gz
+        mv "noVNC-${NOVNC_VERSION}" "$NOVNC_DIR"
+        rm novnc.tar.gz
+        echo "noVNC installed successfully"
+    fi
+else
+    echo "noVNC already present, skipping download"
+fi
+
+# -------------------------------------------------
+# Start Service (Bound to Localhost TCP)
+# -------------------------------------------------
+echo "Starting RaidMan Service..."
+# Kill any existing instance
+killall raidman 2>/dev/null
+
+# Start strict
+# We use a subshell to prevent hanging the console
+( 
+    /usr/local/emhttp/plugins/raidman/raidman -host 127.0.0.1 -port 9876 > /var/log/raidman.log 2>&1 
+) &
+PID=$!
+echo $PID > /var/run/raidman.pid
+echo "RaidMan started with PID $PID"
+
+echo ""
+echo ""
+echo " RaidMan has been installed."
+echo " Copyright 2026, Routecore LLC;"
+echo " Version: ]]>&version;<![CDATA[;"
+echo ""
+echo ""
+]]>
+</INLINE>
+</FILE>
+
+<!--
+The 'remove' script.
+-->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+<![CDATA[
+echo ""
+echo " raidman has been uninstalled."
+echo ""
+echo ""
+
+
+# Kill process
+killall raidman 2>/dev/null
+
+# Clean up Nginx configuration
+rm -f /etc/nginx/conf.d/raidman.conf
+sed -i '\#include /etc/nginx/conf.d/raidman.conf;#d' /etc/nginx/conf.d/locations.conf
+/usr/sbin/nginx -s reload
+
+# Remove files
+rm -rf /usr/local/emhttp/plugins/raidman
+
+# Remove configuration
+rm -rf /boot/config/plugins/raidman
+]]>
+</INLINE>
+</FILE>
+
+</PLUGIN>
