@@ -1,0 +1,7 @@
+# Binaries
+raidman
+*.exe
+*.dll
+
+# OS
+.DS_Store
