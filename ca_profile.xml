@@ -1,0 +1,7 @@
+<CommunityApplications>
+  <Profile>
+    RaidMan provides real-time monitoring and control for the RaidMan mobile app. It securely connects your Unraid server to your RaidMan app.
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/routecore/raidman-plugin/main/icon.png</Icon>
+  <WebPage>https://github.com/routecore/raidman-plugin</WebPage>
+</CommunityApplications>

@@ -7,7 +7,7 @@
 <!ENTITY gitURL    "https://github.com/routecore/raidman-plugin">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/routecore/raidman-plugin/main/raidman.plg">
 ]>
-<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" icon="icon.png" min="6.9.0" support="link">
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" icon="icon.png" min="6.9.0" support="https://github.com/routecore/raidman-plugin/issues">
 
 <CHANGES>
 <CHANGE>2026.02.10 - Initial Release</CHANGE>
