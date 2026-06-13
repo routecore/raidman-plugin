@@ -206,7 +206,7 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 func GetVms() ([]domain.VmInfo, error) {
 	l, err := connect()
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to libvirt: %v", err)
+		return []domain.VmInfo{}, fmt.Errorf("failed to connect to libvirt: %v", err)
 	}
 	defer func() {
 		if err := l.Disconnect(); err != nil {
@@ -217,7 +217,7 @@ func GetVms() ([]domain.VmInfo, error) {
 	// List Defined (Inactive) and Active Domains
 	doms, err := l.Domains()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list domains: %v", err)
+		return []domain.VmInfo{}, fmt.Errorf("failed to list domains: %v", err)
 	}
 
 	var vms []domain.VmInfo

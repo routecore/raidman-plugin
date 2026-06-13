@@ -1,8 +1,17 @@
-<Plugin>
-  <Name>RaidMan</Name>
+<?xml version="1.0" encoding="utf-8"?>
+<Containers>
+  <Plugin>True</Plugin>
   <PluginURL>https://raw.githubusercontent.com/routecore/raidman-plugin/main/raidman.plg</PluginURL>
-  <Support>https://github.com/routecore/raidman-plugin/issues</Support>
-  <Project>https://github.com/routecore/raidman-plugin</Project>
-  <Overview>Remote management plugin for Unraid servers, providing real-time monitoring and control for the RaidMan mobile app.</Overview>
+  <PluginAuthor>Routecore</PluginAuthor>
+  <Beta>False</Beta>
   <Category>Tools:Utilities</Category>
-</Plugin>
+  <multiLanguage>true</multiLanguage>
+  <Name>RaidMan</Name>
+  <Description>
+    Remote management plugin for Unraid servers, providing real-time monitoring and control for the RaidMan mobile app.
+  </Description>
+  <MinVer>6.9.0</MinVer>
+  <Date>2026-02-10</Date>
+  <Support>https://github.com/routecore/raidman-plugin/issues</Support>
+  <Icon>https://raw.githubusercontent.com/routecore/raidman-plugin/main/icon.png</Icon>
+</Containers>

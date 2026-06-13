@@ -166,13 +166,13 @@ func GetContainers() ([]interface{}, error) {
 	ctx := context.Background()
 	cli, err := getDockerClient()
 	if err != nil {
-		return nil, err
+		return []interface{}{}, err
 	}
 	defer cli.Close()
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true, Size: true})
 	if err != nil {
-		return nil, err
+		return []interface{}{}, err
 	}
 
 	if len(containers) == 0 {
