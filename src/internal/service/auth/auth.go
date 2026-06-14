@@ -93,7 +93,7 @@ func HasPermission(key string, resource string, action string) bool {
 	defer keysMutex.RUnlock()
 
 	apiKey, exists := validKeys[key]
-	if !exists {
+	if !exists || apiKey == nil {
 		return false
 	}
 
@@ -160,6 +160,10 @@ func ValidateSecurityLevel(key string, level domain.SecurityLevel, resource stri
 		keysMutex.RLock()
 		apiKey := validKeys[key]
 		keysMutex.RUnlock()
+
+		if apiKey == nil {
+			return fmt.Errorf("insufficient permissions: API key metadata missing")
+		}
 
 		for _, role := range apiKey.Roles {
 			if role == "ADMIN" {

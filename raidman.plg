@@ -99,11 +99,13 @@ if [ ! -d "$NOVNC_DIR" ]; then
         wget -q "https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz" -O novnc.tar.gz
         
         # Verify Checksum (v1.6.0)
-        # Note: This checksum is for the auto-generated tarball from GitHub. 
-        # If GitHub changes compression, this might break. 
-        # Ideally we should host our own verifiable tarball.
-        # For now, we log the sum for audit.
-        echo "Calculated Checksum: $(sha256sum novnc.tar.gz | awk '{print $1}')"
+        EXPECTED_SHA="5066103959ef4e9b10f37e5a148627360dd8414e4cf8a7db92bdbd022e728aaa"
+        CALCULATED_SHA=$(sha256sum novnc.tar.gz | awk '{print $1}')
+        if [ "$EXPECTED_SHA" != "$CALCULATED_SHA" ]; then
+            echo "Error: Checksum validation failed for noVNC (expected $EXPECTED_SHA, got $CALCULATED_SHA)"
+            rm -f novnc.tar.gz
+            exit 1
+        fi
         
         tar -xzf novnc.tar.gz
         mv "noVNC-${NOVNC_VERSION}" "$NOVNC_DIR"
@@ -124,7 +126,7 @@ killall raidman 2>/dev/null
 # Start strict
 # We use a subshell to prevent hanging the console
 ( 
-    /usr/local/emhttp/plugins/raidman/raidman -host 127.0.0.1 -port 9876 > /var/log/raidman.log 2>&1 
+    /usr/local/emhttp/plugins/raidman/raidman -host 127.0.0.1 -port 9876 2>&1 | logger -t raidman
 ) &
 PID=$!
 echo $PID > /var/run/raidman.pid
@@ -155,6 +157,8 @@ echo ""
 
 # Kill process
 killall raidman 2>/dev/null
+rm -f /var/run/raidman.pid
+rm -f /var/log/raidman.log
 
 # Clean up Nginx configuration
 rm -f /etc/nginx/conf.d/raidman.conf

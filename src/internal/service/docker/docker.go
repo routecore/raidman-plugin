@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -85,81 +86,94 @@ func GetContainerStats(containerID string) ([]ContainerStats, error) {
 
 	var containers []types.Container
 	if containerID != "" {
-		// Use List to get container basic info
-
 		containers = append(containers, types.Container{ID: containerID})
 	} else {
-		// List running containers
 		containers, err = cli.ContainerList(ctx, container.ListOptions{})
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	results := make([]ContainerStats, 0)
+	results := make([]ContainerStats, len(containers))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 
-	for _, c := range containers {
+	for idx, c := range containers {
+		wg.Add(1)
+		go func(c types.Container, i int) {
+			defer wg.Done()
 
-		stats, err := cli.ContainerStats(ctx, c.ID, true)
-		if err != nil {
-			continue
-		}
-
-		var statsJSON StatsJSON
-		decoder := json.NewDecoder(stats.Body)
-
-		// Read first sample
-		if err := decoder.Decode(&statsJSON); err != nil {
-			stats.Body.Close()
-			continue
-		}
-
-		// Check if we have valid PreCPUStats
-		if statsJSON.PreCPUStats.CPUUsage.TotalUsage == 0 {
-			// Read second sample (will block for 1s usually)
-			var secondStats StatsJSON
-			if err := decoder.Decode(&secondStats); err == nil {
-				statsJSON = secondStats
+			stats, err := cli.ContainerStats(ctx, c.ID, true)
+			if err != nil {
+				return
 			}
-		}
-		stats.Body.Close()
+			defer stats.Body.Close()
 
-		// Calculate CPU %
-		var cpuPercent = 0.0
-		cpuDelta := float64(statsJSON.CPUStats.CPUUsage.TotalUsage) - float64(statsJSON.PreCPUStats.CPUUsage.TotalUsage)
-		systemDelta := float64(statsJSON.CPUStats.SystemUsage) - float64(statsJSON.PreCPUStats.SystemUsage)
+			var statsJSON StatsJSON
+			decoder := json.NewDecoder(stats.Body)
 
-		if systemDelta > 0.0 && cpuDelta > 0.0 {
-			onlineCPUs := float64(statsJSON.CPUStats.OnlineCPUs)
-			if onlineCPUs == 0.0 {
-				onlineCPUs = float64(len(statsJSON.CPUStats.CPUUsage.PercpuUsage))
+			if err := decoder.Decode(&statsJSON); err != nil {
+				return
 			}
-			cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
-		}
 
-		// Calculate Mem % & Usage
-		memUsage := float64(statsJSON.MemoryStats.Usage)
-		if cache, ok := statsJSON.MemoryStats.Stats["cache"]; ok {
-			memUsage = memUsage - float64(cache)
-		} else if inactive, ok := statsJSON.MemoryStats.Stats["inactive_file"]; ok {
-			memUsage = memUsage - float64(inactive)
-		}
+			if statsJSON.PreCPUStats.CPUUsage.TotalUsage == 0 {
+				var secondStats StatsJSON
+				if err := decoder.Decode(&secondStats); err == nil {
+					statsJSON = secondStats
+				}
+			}
 
-		memLimit := float64(statsJSON.MemoryStats.Limit)
-		memPercent := 0.0
-		if memLimit > 0 {
-			memPercent = (memUsage / memLimit) * 100.0
-		}
+			// Calculate CPU %
+			var cpuPercent = 0.0
+			cpuDelta := float64(statsJSON.CPUStats.CPUUsage.TotalUsage) - float64(statsJSON.PreCPUStats.CPUUsage.TotalUsage)
+			systemDelta := float64(statsJSON.CPUStats.SystemUsage) - float64(statsJSON.PreCPUStats.SystemUsage)
 
-		results = append(results, ContainerStats{
-			ID:       c.ID,
-			CPUPerc:  fmt.Sprintf("%.2f%%", cpuPercent),
-			MemPerc:  fmt.Sprintf("%.2f%%", memPercent),
-			MemUsage: fmt.Sprintf("%s / %s", units.HumanSize(memUsage), units.HumanSize(memLimit)),
-		})
+			if systemDelta > 0.0 && cpuDelta > 0.0 {
+				onlineCPUs := float64(statsJSON.CPUStats.OnlineCPUs)
+				if onlineCPUs == 0.0 {
+					onlineCPUs = float64(len(statsJSON.CPUStats.CPUUsage.PercpuUsage))
+				}
+				cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
+			}
+
+			// Calculate Mem % & Usage
+			memUsage := float64(statsJSON.MemoryStats.Usage)
+			if cache, ok := statsJSON.MemoryStats.Stats["cache"]; ok {
+				memUsage = memUsage - float64(cache)
+			} else if inactive, ok := statsJSON.MemoryStats.Stats["inactive_file"]; ok {
+				memUsage = memUsage - float64(inactive)
+			}
+
+			memLimit := float64(statsJSON.MemoryStats.Limit)
+			memPercent := 0.0
+			if memLimit > 0 {
+				memPercent = (memUsage / memLimit) * 100.0
+			}
+
+			statItem := ContainerStats{
+				ID:       c.ID,
+				CPUPerc:  fmt.Sprintf("%.2f%%", cpuPercent),
+				MemPerc:  fmt.Sprintf("%.2f%%", memPercent),
+				MemUsage: fmt.Sprintf("%s / %s", units.HumanSize(memUsage), units.HumanSize(memLimit)),
+			}
+
+			mu.Lock()
+			results[i] = statItem
+			mu.Unlock()
+		}(c, idx)
 	}
 
-	return results, nil
+	wg.Wait()
+
+	// Filter out uninitialized items (if any container stats failed)
+	filteredResults := make([]ContainerStats, 0, len(results))
+	for _, res := range results {
+		if res.ID != "" {
+			filteredResults = append(filteredResults, res)
+		}
+	}
+
+	return filteredResults, nil
 }
 
 func GetContainers() ([]interface{}, error) {

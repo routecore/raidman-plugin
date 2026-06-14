@@ -81,6 +81,10 @@ func WatchSettings() {
 
 	// Watch the directory because editors might atomic save (rename)
 	dir := filepath.Dir(SettingsPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("[CONFIG] Error creating settings directory %s: %v", dir, err)
+		return
+	}
 	if err := watcher.Add(dir); err != nil {
 		log.Printf("[CONFIG] Error watching directory %s: %v", dir, err)
 		return

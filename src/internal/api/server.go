@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,22 +83,10 @@ func (a *Api) Run() error {
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-
-		if origin == "" {
+		if isSafeOrigin(r) {
 			return true
 		}
-		// Check for same origin
-		host := r.Host
-		if strings.HasPrefix(origin, "http://"+host) || strings.HasPrefix(origin, "https://"+host) {
-			return true
-		}
-
-		if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
-			return true
-		}
-
-		log.Printf("[SECURITY] WS Blocked Origin: %s", origin)
+		log.Printf("[SECURITY] WS Blocked Origin: %s", r.Header.Get("Origin"))
 		return false
 	},
 }
@@ -265,16 +254,16 @@ func (a *Api) handleArrayStream(c *websocket.Conn) {
 	var lastUpdate time.Time
 	var lastBroadcast time.Time
 
-	broadcast := func() {
+	broadcast := func() bool {
 		// Debounce: Only broadcast once per second max
 		if time.Since(lastBroadcast) < 900*time.Millisecond {
-			return
+			return true
 		}
 
 		status, err := array.GetArrayStatus()
 		if err != nil {
 			log.Printf("Error getting array status: %v", err)
-			return
+			return true
 		}
 
 		now := time.Now()
@@ -304,12 +293,15 @@ func (a *Api) handleArrayStream(c *websocket.Conn) {
 
 		c.SetWriteDeadline(time.Now().Add(writeWait))
 		if err := c.WriteJSON(wrapper); err != nil {
-			return
+			return false
 		}
+		return true
 	}
 
 	// Initial broadcast
-	broadcast()
+	if !broadcast() {
+		return
+	}
 
 	for {
 		select {
@@ -321,8 +313,9 @@ func (a *Api) handleArrayStream(c *websocket.Conn) {
 			name := filepath.Base(event.Name)
 			if name == "var.ini" || name == "disks.ini" || name == "devs.ini" {
 				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Rename == fsnotify.Rename {
-
-					broadcast()
+					if !broadcast() {
+						return
+					}
 				}
 			}
 
@@ -333,8 +326,9 @@ func (a *Api) handleArrayStream(c *websocket.Conn) {
 			log.Println("Watcher error:", err)
 
 		case <-ticker.C:
-
-			broadcast()
+			if !broadcast() {
+				return
+			}
 		}
 	}
 }
@@ -506,7 +500,10 @@ func (a *Api) handlePty(c *websocket.Conn, termType string, r *http.Request) {
 		c.WriteMessage(websocket.TextMessage, []byte("Error starting pty: "+err.Error()))
 		return
 	}
-	defer func() { _ = ptmx.Close() }()
+	defer func() {
+		_ = ptmx.Close()
+		_ = cmd.Wait() // Reaps the child process to prevent zombie leaks
+	}()
 
 	go func() {
 		for {
@@ -520,7 +517,7 @@ func (a *Api) handlePty(c *websocket.Conn, termType string, r *http.Request) {
 		}
 	}()
 
-	buf := make([]byte, 1024)
+	buf := make([]byte, 4096)
 	for {
 		n, err := ptmx.Read(buf)
 		if err != nil {
@@ -534,19 +531,54 @@ func (a *Api) handlePty(c *websocket.Conn, termType string, r *http.Request) {
 	}
 }
 
-func getAuthKey(r *http.Request) string {
+func isSafeOrigin(r *http.Request) bool {
+	// Get Origin or Referer header
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = r.Header.Get("Referer")
+	}
 
+	// Non-browser clients (like curl, React Native, or mobile app) do not send Origin/Referer
+	// for simple HTTP requests. This is standard and safe.
+	if origin == "" {
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	hostname := u.Hostname()
+	expectedHost := r.Host
+	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		expectedHost = h
+	}
+
+	// Must match the server host, localhost, or loopback
+	return hostname == expectedHost || hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
+}
+
+func getAuthKey(r *http.Request) string {
+	// Header-based auth is always safe from CSRF
 	key := r.Header.Get("x-api-key")
 	if key != "" {
 		return key
 	}
 
+	// Cookie-based auth must pass the Safe Origin check to prevent CSRF
+	var cookieVal string
 	if cookie, err := r.Cookie("x-api-key"); err == nil {
-		return cookie.Value
+		cookieVal = cookie.Value
+	} else if cookie, err := r.Cookie("raidman_session"); err == nil {
+		cookieVal = cookie.Value
 	}
 
-	if cookie, err := r.Cookie("raidman_session"); err == nil {
-		return cookie.Value
+	if cookieVal != "" {
+		if isSafeOrigin(r) {
+			return cookieVal
+		}
+		log.Printf("[SECURITY] Blocked CSRF attempt using cookies from untrusted origin: %s", r.Header.Get("Origin"))
 	}
 
 	return ""
@@ -635,7 +667,7 @@ func (a *Api) handleVmIcon(w http.ResponseWriter, r *http.Request) {
 
 	// Sanitize filename
 	// Use strict regex validation instead of weak replacement
-	if !isValidSafeName(iconName) {
+	if iconName == "." || iconName == ".." || !isValidSafeName(iconName) {
 		http.Error(w, "Invalid icon name", http.StatusBadRequest)
 		return
 	}
@@ -787,12 +819,14 @@ func (a *Api) registerNoVNC(mux *http.ServeMux) {
 			return
 		}
 
+		isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 		http.SetCookie(w, &http.Cookie{
 			Name:     "raidman_session",
 			Value:    clientKey,
 			Path:     "/raidman/",
 			MaxAge:   3600,
 			HttpOnly: true,
+			Secure:   isSecure,
 			SameSite: http.SameSiteLaxMode,
 		})
 

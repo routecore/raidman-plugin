@@ -402,18 +402,33 @@ func CalculateSpeeds(curr *domain.ArrayStatus, prev *domain.ArrayStatus, deltaSe
 	mapDisks := func(s *domain.ArrayStatus) map[string]domain.ArrayDisk {
 		m := make(map[string]domain.ArrayDisk)
 		for _, d := range s.Disks {
-			m[d.Name] = d
+			key := d.Name
+			if key == "" {
+				key = d.Id
+			}
+			m[key] = d
 		}
 		for _, d := range s.Parities {
-			m[d.Name] = d
+			key := d.Name
+			if key == "" {
+				key = d.Id
+			}
+			m[key] = d
 		}
 		for _, d := range s.Caches {
-			m[d.Name] = d
+			key := d.Name
+			if key == "" {
+				key = d.Id
+			}
+			m[key] = d
 		}
 		for _, d := range s.Unassigned {
-			m[d.Name] = d
-		} // Name might be empty/dup? Use Id preferably
-		// Unassigned usually have Id="Dev X" or similar.
+			key := d.Name
+			if key == "" {
+				key = d.Id
+			}
+			m[key] = d
+		}
 		if s.Boot != nil {
 			m["boot"] = *s.Boot
 		}

@@ -25,5 +25,9 @@ func ExecuteAction(action string) error {
 		return fmt.Errorf("failed to start %s: %v", action, err)
 	}
 
+	go func() {
+		_ = cmd.Wait()
+	}()
+
 	return nil
 }
