@@ -127,7 +127,7 @@ killall raidman 2>/dev/null
 # We use a subshell to prevent hanging the console
 ( 
     /usr/local/emhttp/plugins/raidman/raidman -host 127.0.0.1 -port 9876 2>&1 | logger -t raidman
-) &
+) >/dev/null 2>&1 &
 PID=$!
 echo $PID > /var/run/raidman.pid
 echo "RaidMan started with PID $PID"
