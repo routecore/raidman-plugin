@@ -8,7 +8,7 @@ import (
 	"github.com/routecore/raidman-plugin/src/internal/service"
 )
 
-var Version = "1.0.0"
+var Version = "2026.06.14"
 
 func main() {
 	port := flag.String("port", "9876", "Port to listen on")

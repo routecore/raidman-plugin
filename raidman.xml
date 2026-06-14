@@ -11,7 +11,7 @@
     Remote management plugin for Unraid servers, providing real-time monitoring and control for the RaidMan mobile app.
   </Description>
   <MinVer>6.9.0</MinVer>
-  <Date>2026-02-10</Date>
+  <Date>2026-06-14</Date>
   <Support>https://github.com/routecore/raidman-plugin/issues</Support>
   <Icon>https://raw.githubusercontent.com/routecore/raidman-plugin/main/icon.png</Icon>
 </Containers>

@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "raidman">
 <!ENTITY author    "Routecore">
-<!ENTITY version   "2026.02.10">
+<!ENTITY version   "2026.06.14">
 <!ENTITY launch    "Settings/raidman">
 <!ENTITY gitURL    "https://github.com/routecore/raidman-plugin">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/routecore/raidman-plugin/main/raidman.plg">
@@ -10,6 +10,7 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" icon="icon.png" min="6.9.0" support="https://github.com/routecore/raidman-plugin/issues">
 
 <CHANGES>
+<CHANGE>2026.06.14 - Bug fixes and robustness improvements</CHANGE>
 <CHANGE>2026.02.10 - Initial Release</CHANGE>
 </CHANGES>
 
