@@ -166,9 +166,14 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 
 					ip := GetVmIp(l, dom)
 
+					model := ""
+					if i.Model != nil {
+						model = i.Model.Type
+					}
+
 					info.Interfaces = append(info.Interfaces, domain.VmInterface{
 						Mac:       mac,
-						Model:     i.Model.Type,
+						Model:     model,
 						Network:   net,
 						IpAddress: ip,
 					})
@@ -220,7 +225,7 @@ func GetVms() ([]domain.VmInfo, error) {
 		return []domain.VmInfo{}, fmt.Errorf("failed to list domains: %v", err)
 	}
 
-	var vms []domain.VmInfo
+	vms := make([]domain.VmInfo, 0)
 
 	for _, dom := range doms {
 		info, err := enrichVmInfo(l, dom)

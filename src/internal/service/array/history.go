@@ -21,7 +21,7 @@ func GetParityHistory() ([]ParityCheckHistory, error) {
 		return []ParityCheckHistory{}, nil
 	}
 
-	var history []ParityCheckHistory
+	history := make([]ParityCheckHistory, 0)
 	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
 
 	for i := len(lines) - 1; i >= 0; i-- {

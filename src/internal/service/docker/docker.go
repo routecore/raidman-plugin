@@ -96,7 +96,7 @@ func GetContainerStats(containerID string) ([]ContainerStats, error) {
 		}
 	}
 
-	var results []ContainerStats
+	results := make([]ContainerStats, 0)
 
 	for _, c := range containers {
 
@@ -192,7 +192,7 @@ func GetContainers() ([]interface{}, error) {
 	}
 
 	// 3. Inspect each container to match original output format (full JSON) and inject fields
-	var result []interface{}
+	result := make([]interface{}, 0)
 
 	for _, c := range containers {
 		// We need full details
