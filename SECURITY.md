@@ -35,5 +35,5 @@ The `raidman.page` file is a PHP script that integrates with Unraid's Dynamix we
 
 ## Best Practices
 - Rotate API keys regularly.
-- Monitor logs in the Unraid Syslog (tagged `raidman`).
+- Monitor logs in `/var/log/raidman.log`.
 - Report security issues to security@raidman.app.
