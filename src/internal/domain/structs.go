@@ -203,4 +203,9 @@ type ArrayDisk struct {
 	ReadSpeed  float64 `json:"readSpeed"`
 	WriteSpeed float64 `json:"writeSpeed"`
 	Temp       int     `json:"temp"`
+	FsSize     int64   `json:"fsSize"`
+	FsUsed     int64   `json:"fsUsed"`
+	FsFree     int64   `json:"fsFree"`
+	FsType     string  `json:"fsType"`
+	IsSpinning bool    `json:"isSpinning"`
 }

@@ -271,11 +271,38 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 			fmt.Sscanf(data["idx"], "%d", &d.Idx)
 
 			d.NumReads, d.NumWrites, d.NumErrors, d.ReadBytes, d.WriteBytes = parseStats(data)
+			if d.Device != "" {
+				if rb, wb := getDeviceStats(d.Device); rb > 0 || wb > 0 {
+					d.ReadBytes = rb
+					d.WriteBytes = wb
+				}
+			}
 
 			// Temp can be "*" or number
 			tempVal := data["temp"]
 			if tempVal != "*" && tempVal != "" {
 				fmt.Sscanf(tempVal, "%d", &d.Temp)
+			}
+
+			// Parse Filesystem and Spin info
+			if val, ok := data["fsSize"]; ok {
+				fmt.Sscanf(val, "%d", &d.FsSize)
+			}
+			if val, ok := data["fsUsed"]; ok {
+				fmt.Sscanf(val, "%d", &d.FsUsed)
+			}
+			if val, ok := data["fsFree"]; ok {
+				fmt.Sscanf(val, "%d", &d.FsFree)
+			}
+			if val, ok := data["fsType"]; ok {
+				d.FsType = val
+			} else {
+				d.FsType = "auto"
+			}
+			if val, ok := data["spundown"]; ok {
+				d.IsSpinning = val == "0"
+			} else {
+				d.IsSpinning = true
 			}
 
 			diskType := data["type"]
@@ -284,13 +311,19 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 			case "Flash":
 				status.Boot = &d
 			case "Parity":
-				status.Parities = append(status.Parities, d)
+				if d.Device != "" || d.State != "DISK_NP" {
+					status.Parities = append(status.Parities, d)
+				}
 			case "Data":
-				status.Disks = append(status.Disks, d)
+				if d.Device != "" || d.State != "DISK_NP" {
+					status.Disks = append(status.Disks, d)
+				}
 			case "Cache":
-				status.Caches = append(status.Caches, d)
+				if d.Device != "" && d.State != "DISK_NP" {
+					status.Caches = append(status.Caches, d)
+				}
 			default:
-				if d.Name != "" {
+				if d.Name != "" && d.Device != "" && d.State != "DISK_NP" {
 					status.Caches = append(status.Caches, d)
 				}
 			}
@@ -313,14 +346,45 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 				State:      "DISK_OK", // Usually Unassigned are OK if present
 			}
 
+			if d.Device == "" {
+				continue
+			}
+
 			if val, ok := data["size"]; ok {
 				fmt.Sscanf(val, "%d", &d.Size)
 			}
 
 			d.NumReads, d.NumWrites, d.NumErrors, d.ReadBytes, d.WriteBytes = parseStats(data)
+			if d.Device != "" {
+				if rb, wb := getDeviceStats(d.Device); rb > 0 || wb > 0 {
+					d.ReadBytes = rb
+					d.WriteBytes = wb
+				}
+			}
 
 			if val, ok := data["temp"]; ok && val != "*" {
 				fmt.Sscanf(val, "%d", &d.Temp)
+			}
+
+			// Parse Filesystem and Spin info for Unassigned Devices
+			if val, ok := data["fsSize"]; ok {
+				fmt.Sscanf(val, "%d", &d.FsSize)
+			}
+			if val, ok := data["fsUsed"]; ok {
+				fmt.Sscanf(val, "%d", &d.FsUsed)
+			}
+			if val, ok := data["fsFree"]; ok {
+				fmt.Sscanf(val, "%d", &d.FsFree)
+			}
+			if val, ok := data["fsType"]; ok {
+				d.FsType = val
+			} else {
+				d.FsType = "auto"
+			}
+			if val, ok := data["spundown"]; ok {
+				d.IsSpinning = val == "0"
+			} else {
+				d.IsSpinning = true
 			}
 
 			status.Unassigned = append(status.Unassigned, d)
@@ -328,6 +392,30 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 	}
 
 	return status, nil
+}
+
+func getDeviceStats(device string) (int64, int64) {
+	if device == "" {
+		return 0, 0
+	}
+	path := fmt.Sprintf("/sys/block/%s/stat", device)
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 7 {
+			var rSects, wSects int64
+			fmt.Sscanf(fields[2], "%d", &rSects)
+			fmt.Sscanf(fields[6], "%d", &wSects)
+			return rSects * 512, wSects * 512
+		}
+	}
+	return 0, 0
 }
 
 func parseIniFile(path string) (map[string]string, error) {
