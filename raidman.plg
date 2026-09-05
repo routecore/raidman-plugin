@@ -21,20 +21,24 @@ The 'source' file.
 
 <FILE Name="/boot/config/plugins/&name;/raidman.conf">
 <URL>https://raw.githubusercontent.com/routecore/raidman-plugin/main/raidman.conf</URL>
+<SHA256>89aee5f9ad0d4ef3621e47574ca42762627d6b2d7a33495895a62a60d2e5f639</SHA256>
 </FILE>
 
 <FILE Name="/boot/config/plugins/&name;/raidman">
 <URL>https://github.com/routecore/raidman-plugin/releases/download/&version;/raidman</URL>
+<SHA256>c40d6f832b34fff9502c4db57d6c51eafa3090990a59ff001abc489b99bca752</SHA256>
 </FILE>
 
 <FILE Name="/boot/config/plugins/&name;/raidman.page">
 <URL>https://raw.githubusercontent.com/routecore/raidman-plugin/main/src/raidman.page</URL>
+<SHA256>ae8d9d9b5cd9bac1c9bd6b1ed57c891398ad5b90b283641c27c7b1427ca711e8</SHA256>
 </FILE>
 
 
 
 <FILE Name="/boot/config/plugins/&name;/icon.png">
 <URL>https://raw.githubusercontent.com/routecore/raidman-plugin/main/icon.png</URL>
+<SHA256>88c3cd8a6083c8275283f08ece7f6a332fc261cc694c2f0660966a3cd8014d1f</SHA256>
 </FILE>
 
 <!--
