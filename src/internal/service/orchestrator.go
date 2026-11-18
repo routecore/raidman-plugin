@@ -1,19 +1,19 @@
 package service
 
 import (
+	"context"
 	"log"
 	"mime"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/routecore/raidman-plugin/src/internal/api"
 	"github.com/routecore/raidman-plugin/src/internal/domain"
 	"github.com/routecore/raidman-plugin/src/internal/monitor"
 	"github.com/routecore/raidman-plugin/src/internal/service/auth"
 	"github.com/routecore/raidman-plugin/src/internal/service/config"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 type Orchestrator struct {
@@ -29,12 +29,18 @@ func CreateOrchestrator(ctx *domain.Context) *Orchestrator {
 func (o *Orchestrator) Run() error {
 	log.Printf("Starting Raidman Plugin (Version: %s)...", o.ctx.Config.Version)
 
-	// Load API Keys
-	auth.LoadApiKeys()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Load Settings
+	// Settings first: the key allowlist depends on them.
 	config.LoadSettings()
 	config.WatchSettings()
+
+	// API keys from the upstream key store. The watcher also handles the
+	// directory being created after startup (first key ever created).
+	keys := auth.NewStore(auth.DefaultKeysPath, config.AllowPolicy)
+	keys.Reload()
+	go keys.Watch(ctx)
 
 	mime.AddExtensionType(".css", "text/css")
 	mime.AddExtensionType(".js", "application/javascript")
@@ -44,61 +50,12 @@ func (o *Orchestrator) Run() error {
 	mime.AddExtensionType(".json", "application/json")
 	mime.AddExtensionType(".wasm", "application/wasm")
 
-	// Initialize API Server
-	server := api.Create(o.ctx)
-
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Printf("Error creating fsnotify watcher for keys: %v", err)
-	} else {
-		defer watcher.Close()
-
-		keysPath := domain.KeysPath
-
-		if _, err := os.Stat(keysPath); os.IsNotExist(err) {
-			log.Printf("Keys directory %s does not exist, skipping watch", keysPath)
-		} else {
-			if err := watcher.Add(keysPath); err != nil {
-				log.Printf("Error watching keys path: %v", err)
-			} else {
-				log.Printf("Watching %s for API Key changes", keysPath)
-			}
-		}
-
-		go func() {
-			for {
-				select {
-				case event, ok := <-watcher.Events:
-					if !ok {
-						return
-					}
-					// Check for relevant file events
-					if event.Op&fsnotify.Write == fsnotify.Write ||
-						event.Op&fsnotify.Create == fsnotify.Create ||
-						event.Op&fsnotify.Remove == fsnotify.Remove ||
-						event.Op&fsnotify.Rename == fsnotify.Rename {
-
-						log.Println("Key directory changed, reloading keys...")
-						auth.LoadApiKeys()
-					}
-				case err, ok := <-watcher.Errors:
-					if !ok {
-						return
-					}
-					log.Println("Key Watcher error:", err)
-				}
-			}
-		}()
-	}
-
-	// Start API
+	server := api.Create(o.ctx, keys)
+	serverErr := make(chan error, 1)
 	go func() {
-		if err := server.Run(); err != nil {
-			log.Fatalf("API Server failed: %v", err)
-		}
+		serverErr <- server.Run()
 	}()
 
-	// Start Nginx Configuration Monitor
 	nginxMonitor, err := monitor.NewNginxMonitor()
 	if err != nil {
 		log.Printf("Failed to create Nginx Monitor: %v", err)
@@ -107,10 +64,21 @@ func (o *Orchestrator) Run() error {
 		nginxMonitor.Start()
 	}
 
-	// Wait for shutdown signal
-	w := make(chan os.Signal, 1)
-	signal.Notify(w, syscall.SIGTERM, syscall.SIGINT)
-	log.Printf("Received %s signal. Shutting down...", <-w)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	select {
+	case s := <-sig:
+		log.Printf("Received %s signal. Shutting down...", s)
+	case err := <-serverErr:
+		if err != nil {
+			return err
+		}
+	}
 
+	shutdownCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Shutdown: %v", err)
+	}
 	return nil
 }

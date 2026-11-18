@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,7 +22,7 @@ var (
 )
 
 func GetArrayStatus() (*domain.ArrayStatus, error) {
-	return getArrayStatusWithPaths("/var/local/emhttp/var.ini", "/var/local/emhttp/disks.ini", "/var/local/emhttp/devs.ini")
+	return getArrayStatusWithPaths(VarIniPath, DisksIniPath, DevsIniPath)
 }
 
 func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*domain.ArrayStatus, error) {
@@ -160,9 +161,11 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 				suffix = "SYNC"
 			}
 
-			// mdResyncDt (dTime) tells us if it's progressing.
-			// If dTime > 0 it is RUNNING. If 0 it is PAUSED.
-			if dTime > 0 {
+			// Running vs paused like the webGUI's Pause/Resume button
+			// (ArrayOperation.page): mdResync != 0 while running, 0 while
+			// paused. Kept identical to ReadParityState so the app never
+			// offers an action the parity endpoints then refuse.
+			if parseInt("mdResync") != 0 {
 				status.ParityCheckStatus.Status = "RUNNING_" + suffix
 			} else {
 				status.ParityCheckStatus.Status = "PAUSED_" + suffix
@@ -254,8 +257,10 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 
 	// 2. Read /var/local/emhttp/disks.ini for Disk Details
 	disksMap, err := parseIniSections(disksIniPath)
+	var bootSlots, flashSlots []domain.ArrayDisk
 	if err == nil {
-		for section, data := range disksMap {
+		for _, section := range sortedSections(disksMap) {
+			data := disksMap[section]
 			if len(data) == 0 {
 				continue
 			}
@@ -306,10 +311,16 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 			}
 
 			diskType := data["type"]
+			d.Type = diskType
+			d.FsStatus = data["fsStatus"]
+			d.FsMountpoint = data["fsMountpoint"]
 
 			switch diskType {
+			case "Boot":
+				// Unraid 7.3+ internal boot device(s).
+				bootSlots = append(bootSlots, d)
 			case "Flash":
-				status.Boot = &d
+				flashSlots = append(flashSlots, d)
 			case "Parity":
 				if d.Device != "" || d.State != "DISK_NP" {
 					status.Parities = append(status.Parities, d)
@@ -330,10 +341,13 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 		}
 	}
 
+	status.Boot, status.BootDevices = selectBoot(bootSlots, flashSlots)
+
 	// 3. Read /var/local/emhttp/devs.ini for Unassigned Devices
 	devsMap, err := parseIniSections(devsIniPath)
 	if err == nil {
-		for section, data := range devsMap {
+		for _, section := range sortedSections(devsMap) {
+			data := devsMap[section]
 			if len(data) == 0 {
 				continue
 			}
@@ -392,6 +406,69 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 	}
 
 	return status, nil
+}
+
+// selectBoot mirrors unraid-api core/modules/array/get-array-data.ts:
+// internal boot slots (type "Boot", Unraid 7.3+) win over the USB flash; among
+// candidates prefer the one mounted at /boot, then the first present device,
+// then the first mounted one.
+func selectBoot(bootSlots, flashSlots []domain.ArrayDisk) (*domain.ArrayDisk, []domain.ArrayDisk) {
+	candidates := bootSlots
+	if len(candidates) == 0 {
+		for _, f := range flashSlots {
+			if f.FsMountpoint == "" || f.FsMountpoint == "/boot" {
+				candidates = append(candidates, f)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	pick := func(i int) (*domain.ArrayDisk, []domain.ArrayDisk) {
+		b := candidates[i]
+		return &b, candidates
+	}
+	for i, c := range candidates {
+		if c.FsMountpoint == "/boot" {
+			return pick(i)
+		}
+	}
+	for i, c := range candidates {
+		if c.State == "DISK_NP" || c.State == "DISK_NP_DSBL" || c.Device == "" {
+			continue
+		}
+		return pick(i)
+	}
+	for i, c := range candidates {
+		if c.FsStatus == "Mounted" {
+			return pick(i)
+		}
+	}
+	return pick(0)
+}
+
+// sortedSections returns ini sections ordered by slot index (then name) so
+// output order is stable (disks.ini order: parity, disk1..N, pools, flash).
+func sortedSections(m map[string]map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	idx := func(k string) int {
+		n, err := strconv.Atoi(m[k]["idx"])
+		if err != nil {
+			return 1 << 30
+		}
+		return n
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		a, b := idx(keys[i]), idx(keys[j])
+		if a != b {
+			return a < b
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
 }
 
 func getDeviceStats(device string) (int64, int64) {

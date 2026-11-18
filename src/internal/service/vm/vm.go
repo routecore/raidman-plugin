@@ -1,15 +1,18 @@
 package vm
 
 import (
+	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/routecore/raidman-plugin/src/internal/domain"
 
 	libvirt "github.com/digitalocean/go-libvirt"
-	libvirtxml "github.com/libvirt/libvirt-go-xml"
+	"libvirt.org/go/libvirtxml"
 )
 
 // Helper to connect to libvirt
@@ -27,6 +30,66 @@ func connect() (*libvirt.Libvirt, error) {
 	}
 
 	return l, nil
+}
+
+// ParseUUID parses a libvirt domain UUID in canonical (8-4-4-4-12) or plain
+// 32-hex form.
+func ParseUUID(s string) (libvirt.UUID, bool) {
+	var u libvirt.UUID
+	h := strings.ReplaceAll(s, "-", "")
+	if len(h) != 32 || (len(s) != 32 && len(s) != 36) {
+		return u, false
+	}
+	if len(s) == 36 && (s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-') {
+		return u, false
+	}
+	b, err := hex.DecodeString(h)
+	if err != nil {
+		return u, false
+	}
+	copy(u[:], b)
+	return u, true
+}
+
+// FormatUUID renders a libvirt UUID in canonical form.
+func FormatUUID(u libvirt.UUID) string {
+	h := hex.EncodeToString(u[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// lookupDomain resolves a VM reference: a UUID (what the official API calls
+// the VM id) or the exact libvirt name, which may contain spaces/Unicode.
+// Names are passed to libvirt over RPC, never through a shell.
+func lookupDomain(l *libvirt.Libvirt, ref string) (libvirt.Domain, error) {
+	if u, ok := ParseUUID(ref); ok {
+		if dom, err := l.DomainLookupByUUID(u); err == nil {
+			return dom, nil
+		}
+	}
+	return l.DomainLookupByName(ref)
+}
+
+// ErrNotRunning is returned when a VM must be running for an operation.
+var ErrNotRunning = errors.New("VM is not running")
+
+// Domain identifies a resolved VM.
+type Domain struct {
+	Name string
+	UUID string
+}
+
+// ResolveDomain resolves a VM reference to its exact libvirt name and UUID.
+func ResolveDomain(ref string) (*Domain, error) {
+	l, err := connect()
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to libvirt: %v", err)
+	}
+	defer l.Disconnect()
+	dom, err := lookupDomain(l, ref)
+	if err != nil {
+		return nil, err
+	}
+	return &Domain{Name: dom.Name, UUID: FormatUUID(dom.UUID)}, nil
 }
 
 func GetVmIp(l *libvirt.Libvirt, dom libvirt.Domain) string {
@@ -52,7 +115,7 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 	if dom.ID != -1 {
 		info.DomId = fmt.Sprintf("%d", dom.ID)
 	}
-	info.Uuid = fmt.Sprintf("%x", dom.UUID)
+	info.Uuid = fmt.Sprintf("%x", dom.UUID) // protocol-1 format (32 hex, no dashes)
 
 	// Get State & Info
 	state, maxMem, _, nrVirtCpu, cpuTime, err := l.DomainGetInfo(dom)
@@ -249,7 +312,7 @@ func GetVmInfo(vmName string) (*domain.VmInfo, error) {
 		}
 	}()
 
-	dom, err := l.DomainLookupByName(vmName)
+	dom, err := lookupDomain(l, vmName)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +328,7 @@ func SetVmAutostart(vmName string, enabled bool) error {
 	}
 	defer l.Disconnect()
 
-	dom, err := l.DomainLookupByName(vmName)
+	dom, err := lookupDomain(l, vmName)
 	if err != nil {
 		return err
 	}
@@ -283,7 +346,7 @@ func ExecuteVmAction(vmName string, action string) error {
 	}
 	defer l.Disconnect()
 
-	dom, err := l.DomainLookupByName(vmName)
+	dom, err := lookupDomain(l, vmName)
 	if err != nil {
 		return err
 	}
@@ -316,7 +379,7 @@ func GetVncPort(vmName string) (string, error) {
 	}
 	defer l.Disconnect()
 
-	dom, err := l.DomainLookupByName(vmName)
+	dom, err := lookupDomain(l, vmName)
 	if err != nil {
 		return "", err
 	}
@@ -334,6 +397,10 @@ func GetVncPort(vmName string) (string, error) {
 	if domCfg.Devices != nil {
 		for _, g := range domCfg.Devices.Graphics {
 			if g.VNC != nil {
+				if g.VNC.Port <= 0 {
+					// autoport VM that is not running has port -1
+					return "", ErrNotRunning
+				}
 				return fmt.Sprintf("%d", g.VNC.Port), nil
 			}
 		}

@@ -1,46 +1,5 @@
 package domain
 
-// Constants
-const (
-	KeysPath = "/boot/config/plugins/dynamix.my.servers/keys"
-)
-
-// ApiKeyPermissions represents an API key with its associated permissions and roles
-type ApiKeyPermissions struct {
-	Key         string   `json:"key"`
-	Permissions []string `json:"permissions"` // e.g., ["docker:*", "vm:read", "system:update"]
-	Roles       []string `json:"roles"`       // e.g., ["ADMIN", "VIEWER"]
-}
-
-// Permission constants for resource-based access control
-const (
-	// Resources
-	PermResourceDocker  = "docker"
-	PermResourceVM      = "vm"
-	PermResourceSystem  = "system"
-	PermResourceArray   = "array"
-	PermResourceShare   = "share"
-	PermResourceNetwork = "network"
-
-	// Actions
-	PermActionCreate = "create"
-	PermActionRead   = "read"
-	PermActionUpdate = "update"
-	PermActionDelete = "delete"
-	PermActionAll    = "*"
-)
-
-// SecurityLevel defines the security requirements for different operations
-type SecurityLevel int
-
-const (
-	SecurityLevelPublic     SecurityLevel = iota // No auth needed
-	SecurityLevelRead                            // Read-only operations
-	SecurityLevelWrite                           // Write operations
-	SecurityLevelPrivileged                      // Terminal, VNC, system actions
-	SecurityLevelAdmin                           // Full system control
-)
-
 // XML Structures for parsing virsh dumpxml
 type DomainXml struct {
 	Description string   `xml:"description"`
@@ -169,7 +128,10 @@ type ArrayStatus struct {
 	Disks             []ArrayDisk        `json:"disks"`
 	Caches            []ArrayDisk        `json:"caches"`
 	Boot              *ArrayDisk         `json:"boot"`
-	Unassigned        []ArrayDisk        `json:"unassigned"`
+	// BootDevices lists every boot slot (Unraid 7.3 internal boot pools can
+	// have several). Optional; older plugin versions omit it.
+	BootDevices []ArrayDisk `json:"bootDevices,omitempty"`
+	Unassigned  []ArrayDisk `json:"unassigned"`
 }
 
 type ParityCheckStatus struct {
@@ -208,4 +170,8 @@ type ArrayDisk struct {
 	FsFree     int64   `json:"fsFree"`
 	FsType     string  `json:"fsType"`
 	IsSpinning bool    `json:"isSpinning"`
+	// Optional fields (added in protocol 2).
+	Type         string `json:"type,omitempty"` // disks.ini slot type: Parity, Data, Cache, Flash, Boot
+	FsStatus     string `json:"fsStatus,omitempty"`
+	FsMountpoint string `json:"fsMountpoint,omitempty"`
 }

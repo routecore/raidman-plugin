@@ -1,0 +1,128 @@
+#!/bin/bash
+#
+# /etc/rc.d/rc.raidman - start/stop/restart the RaidMan daemon.
+#
+# The daemon writes its own PID file, so "stop" always signals the real
+# process (not a wrapper shell), and "start" waits until the previous
+# instance has released the port.
+
+BIN=/usr/local/emhttp/plugins/raidman/raidman
+PIDFILE=/var/run/raidman.pid
+LOG=/var/log/raidman.log
+HOST=127.0.0.1
+PORT=9876
+MAX_LOG_BYTES=$((5 * 1024 * 1024))
+
+running_pid() {
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$(cat /proc/"$pid"/comm 2>/dev/null)" = "raidman" ]; then
+    echo "$pid"
+    return 0
+  fi
+  return 1
+}
+
+port_in_use() {
+  (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null
+}
+
+wait_port_free() {
+  local i
+  for i in $(seq 1 40); do
+    port_in_use || return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+rotate_log() {
+  local size
+  size=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  if [ "$size" -gt "$MAX_LOG_BYTES" ]; then
+    mv -f "$LOG" "$LOG.1"
+  fi
+}
+
+start() {
+  local pid i
+  if pid=$(running_pid); then
+    echo "RaidMan is already running (pid $pid)"
+    return 0
+  fi
+  if [ ! -x "$BIN" ]; then
+    echo "RaidMan binary not found: $BIN"
+    return 1
+  fi
+  if ! wait_port_free; then
+    echo "Port $PORT is still in use; the daemon will keep retrying for 30s"
+  fi
+  rotate_log
+  # setsid detaches from the installer's session; all fds are redirected so
+  # the plugin installer never waits on the daemon.
+  setsid "$BIN" -host "$HOST" -port "$PORT" -pidfile "$PIDFILE" </dev/null >>"$LOG" 2>&1 &
+  for i in $(seq 1 40); do
+    if pid=$(running_pid) && port_in_use; then
+      echo "RaidMan started (pid $pid, listening on $HOST:$PORT)"
+      return 0
+    fi
+    sleep 0.25
+  done
+  if pid=$(running_pid); then
+    echo "RaidMan started (pid $pid) but is not listening yet; see $LOG"
+    return 0
+  fi
+  echo "RaidMan failed to start; last log lines:"
+  tail -n 20 "$LOG" 2>/dev/null
+  return 1
+}
+
+stop() {
+  local pid i
+  if pid=$(running_pid); then
+    kill -TERM "$pid" 2>/dev/null
+    for i in $(seq 1 40); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "RaidMan did not stop in time; killing pid $pid"
+      kill -KILL "$pid" 2>/dev/null
+    fi
+  fi
+  # Instances started by plugin versions without this script (no valid pid file).
+  if pgrep -x raidman >/dev/null 2>&1; then
+    pkill -TERM -x raidman 2>/dev/null
+    for i in $(seq 1 40); do
+      pgrep -x raidman >/dev/null 2>&1 || break
+      sleep 0.25
+    done
+    pkill -KILL -x raidman 2>/dev/null
+  fi
+  rm -f "$PIDFILE"
+  if ! wait_port_free; then
+    echo "Warning: port $PORT is still in use after stopping RaidMan"
+  fi
+  echo "RaidMan stopped"
+}
+
+status() {
+  local pid
+  if pid=$(running_pid); then
+    echo "RaidMan is running (pid $pid)"
+    return 0
+  fi
+  echo "RaidMan is not running"
+  return 3
+}
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac

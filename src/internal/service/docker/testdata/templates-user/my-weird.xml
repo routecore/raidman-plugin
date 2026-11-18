@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>weird</Name>
+  <Repository>someone/weird</Repository>
+  <Shell>python3</Shell>
+  <WebUI>http://my.custom.host:8080/</WebUI>
+</Container>

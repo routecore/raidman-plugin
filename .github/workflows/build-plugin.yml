@@ -4,13 +4,38 @@ on:
   push:
     tags:
       - "*"
+  pull_request:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build Raidman
+  test:
+    name: Vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Check shell scripts
+        run: bash -n src/rc.raidman
+
+  release:
+    name: Build and release
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
 
     steps:
@@ -23,6 +48,21 @@ jobs:
           go-version-file: 'go.mod'
           cache-dependency-path: go.sum
 
+      # The tag must be exactly the plg version: raidman.plg downloads
+      # releases/download/<version>/raidman-<version>.tgz, so a "v" prefix
+      # (or any other difference) would publish an uninstallable release.
+      - name: Resolve version
+        run: |
+          echo "VERSION=${{ github.ref_name }}" >> "$GITHUB_ENV"
+
+      - name: Check plg version matches tag
+        run: |
+          PLG_VERSION=$(sed -n 's/^<!ENTITY version *"\([^"]*\)">/\1/p' raidman.plg)
+          if [ "$PLG_VERSION" != "$VERSION" ]; then
+            echo "raidman.plg version ($PLG_VERSION) does not match tag ($VERSION)"
+            exit 1
+          fi
+
       - name: Build
         env:
           GOOS: linux
@@ -30,20 +70,56 @@ jobs:
           CGO_ENABLED: 0
         run: |
           go mod download
-          go build -v -o raidman src/cmd/app/main.go
+          go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}" -o raidman ./src/cmd/app
+
+      - name: Package
+        run: |
+          mkdir -p pkg
+          cp raidman pkg/raidman
+          cp src/raidman.page pkg/raidman.page
+          cp raidman.conf pkg/raidman.conf
+          cp src/rc.raidman pkg/rc.raidman
+          cp icon.png pkg/icon.png
+          chmod 0755 pkg/raidman pkg/rc.raidman
+          tar --owner=0 --group=0 --sort=name -czf "raidman-${VERSION}.tgz" -C pkg .
+          SHA256=$(sha256sum "raidman-${VERSION}.tgz" | awk '{print $1}')
+          echo "SHA256=${SHA256}" >> "$GITHUB_ENV"
+          echo "${SHA256}  raidman-${VERSION}.tgz" > "raidman-${VERSION}.tgz.sha256"
+
+      - name: Stamp plg with package checksum
+        run: |
+          sed -i "s|^<!ENTITY sha256 *\"[^\"]*\">|<!ENTITY sha256    \"${SHA256}\">|" raidman.plg
+          grep -q "<!ENTITY sha256    \"${SHA256}\">" raidman.plg
 
       - name: Extract Release Notes
         run: |
-          # Extract the line matching the version tag, remove XML tags and whitespace
-          # Strip leading 'v' from tag if present (e.g. v2026.02.10 -> 2026.02.10)
-          TAG_NAME="${{ github.ref_name }}"
-          VERSION="${TAG_NAME#v}"
           grep "<CHANGE>${VERSION}" raidman.plg | sed -e 's/<CHANGE>//' -e 's/<\/CHANGE>//' -e 's/^[ \t]*//' > release_notes.txt || true
-          # If empty, default to the tag name
           if [ ! -s release_notes.txt ]; then echo "${{ github.ref_name }}" > release_notes.txt; fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: raidman
+          files: |
+            raidman-${{ env.VERSION }}.tgz
+            raidman-${{ env.VERSION }}.tgz.sha256
+            raidman.plg
           body_path: release_notes.txt
+
+      # Installed plugins check pluginURL (raidman.plg on main) for updates,
+      # so main must carry the checksum of the released package. Only done
+      # after the release asset exists.
+      - name: Publish stamped plg to main
+        run: |
+          cp raidman.plg /tmp/raidman.plg
+          git fetch origin main
+          git checkout -B main origin/main
+          MAIN_VERSION=$(sed -n 's/^<!ENTITY version *"\([^"]*\)">/\1/p' raidman.plg)
+          if [ "$MAIN_VERSION" != "$VERSION" ]; then
+            echo "main's raidman.plg is at $MAIN_VERSION, not $VERSION; not stamping."
+            exit 1
+          fi
+          cp /tmp/raidman.plg raidman.plg
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): stamp raidman.plg checksum for ${VERSION}" || exit 0
+          git push origin main

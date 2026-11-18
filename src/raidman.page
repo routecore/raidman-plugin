@@ -18,39 +18,65 @@ $defaults = [
 $settings = $defaults;
 if (file_exists($settings_file)) {
     $loaded = json_decode(file_get_contents($settings_file), true);
-    if ($loaded) {
+    if (is_array($loaded)) {
         $settings = array_merge($defaults, $loaded);
     }
 }
+if (!is_array($settings['allowed_api_keys'])) {
+    $settings['allowed_api_keys'] = [];
+}
 
-// Load available keys
+// Load available keys. Only the key id and name are kept: the secret is
+// never rendered into the page. The allowlist stores key ids; entries written
+// by plugin versions before 2026.11 hold raw secrets, which are matched here
+// only to pre-select the right key (and are replaced by ids on save).
 $keys_dir = "/boot/config/plugins/dynamix.my.servers/keys";
-$available_keys = [];
+$available_keys = []; // id => name
+$legacy_selected = []; // ids whose raw secret is in the old allowlist
 if (is_dir($keys_dir)) {
     foreach (glob("$keys_dir/*.json") as $file) {
         $content = json_decode(file_get_contents($file), true);
-        if ($content && isset($content['key'])) {
-            // Use name or default to filename if missing
-            $name = $content['name'] ?? basename($file, ".json");
-            $available_keys[$content['key']] = $name;
+        if (!is_array($content) || empty($content['key'])) {
+            continue;
         }
+        $id = (isset($content['id']) && is_string($content['id']) && $content['id'] !== '') ? $content['id'] : basename($file, ".json");
+        $name = (isset($content['name']) && is_string($content['name']) && $content['name'] !== '') ? $content['name'] : $id;
+        $available_keys[$id] = $name;
+        if (in_array($content['key'], $settings['allowed_api_keys'], true)) {
+            $legacy_selected[] = $id;
+        }
+        unset($content);
     }
 }
+asort($available_keys, SORT_NATURAL | SORT_FLAG_CASE);
 
 // Save settings
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    // "true" string from select comes as string, need conversion
-    $settings['host_terminal_enabled'] = $_POST['host_terminal_enabled'] === "true";
-    $settings['restrict_api_keys'] = $_POST['restrict_api_keys'] === "true";
-    
-    $settings['allowed_api_keys'] = [];
-    if (isset($_POST['allowed_api_keys']) && is_array($_POST['allowed_api_keys'])) {
-        $settings['allowed_api_keys'] = array_values($_POST['allowed_api_keys']);
-    }
+    $settings['host_terminal_enabled'] = ($_POST['host_terminal_enabled'] ?? '') === "true";
+    $settings['restrict_api_keys'] = ($_POST['restrict_api_keys'] ?? '') === "true";
 
-    file_put_contents($settings_file, json_encode($settings, JSON_PRETTY_PRINT));
-    echo "<div class='updated'>Settings saved.</div>";
+    $allowed = [];
+    if (isset($_POST['allowed_api_keys']) && is_array($_POST['allowed_api_keys'])) {
+        foreach ($_POST['allowed_api_keys'] as $id) {
+            // Only ids of keys that exist; never secrets.
+            if (is_string($id) && array_key_exists($id, $available_keys)) {
+                $allowed[] = $id;
+            }
+        }
+    }
+    $settings['allowed_api_keys'] = array_values(array_unique($allowed));
+    $legacy_selected = [];
+
+    if (file_put_contents($settings_file, json_encode($settings, JSON_PRETTY_PRINT)) === false) {
+        echo "<div class='error'>Could not save settings.</div>";
+    } else {
+        echo "<div class='updated'>Settings saved.</div>";
+    }
 }
+
+$is_selected = function ($id) use ($settings, $legacy_selected) {
+    return in_array($id, $settings['allowed_api_keys'], true) || in_array($id, $legacy_selected, true);
+};
 ?>
 
 <form markdown="1" method="post" action="/Settings/raidman">
@@ -62,7 +88,7 @@ Host Terminal Access:
     <option value="true" <?= $settings['host_terminal_enabled'] ? 'selected' : '' ?>>Enabled</option>
     <option value="false" <?= !$settings['host_terminal_enabled'] ? 'selected' : '' ?>>Disabled</option>
   </select>
-  _Enable access to the Host Terminal via RaidMan._
+  _Enable access to the Host Terminal via RaidMan (requires an API key with the ADMIN role)._
 
 Restrict to Specific API Keys:
 : <select name="restrict_api_keys" id="restrict_api_keys" size="1" onchange="toggleKeyList()">
@@ -75,8 +101,8 @@ Restrict to Specific API Keys:
 
 Allowed API Keys:
 : <select id="slot_1" name="allowed_api_keys[]" multiple="multiple" style="display:none">
-    <?php foreach ($available_keys as $key => $name): ?>
-    <option value="<?= htmlspecialchars($key, ENT_QUOTES, 'UTF-8') ?>" <?= in_array($key, $settings['allowed_api_keys']) ? 'selected' : '' ?>><?= htmlspecialchars($name, ENT_QUOTES, 'UTF-8') ?></option>
+    <?php foreach ($available_keys as $id => $name): ?>
+    <option value="<?= htmlspecialchars($id, ENT_QUOTES, 'UTF-8') ?>" <?= $is_selected($id) ? 'selected' : '' ?>><?= htmlspecialchars($name, ENT_QUOTES, 'UTF-8') ?></option>
     <?php endforeach; ?>
   </select>
   _Select the API keys that are allowed to access the plugin._
@@ -106,14 +132,9 @@ function initDropdown() {
 
 function toggleKeyList() {
     var select = document.getElementById('restrict_api_keys');
-    var slot1 = document.getElementById('slot_1');
-    // The dropdownchecklist plugin hides the original select and creates a new structure.
-    // We need to find the generated container. It's usually inserted after the select.
-    // However, for simplicity in Unraid settings, we can often just control the parent DD.
-    
     var dd = $('#slot_1').closest('dd');
     var dt = dd.prev('dt');
-    
+
     if (select.value === "true") {
         dd.show();
         dt.show();
@@ -124,7 +145,6 @@ function toggleKeyList() {
 }
 
 $(function() {
-    // Initial state check
     toggleKeyList();
 });
 </script>
