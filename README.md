@@ -55,7 +55,8 @@ A success response is only sent after Unraid accepted the command.
 | `GET /api/health` | any valid key | `{"version":"2026.11.18","protocol":2,"features":[...],"unraid":"7.2.0","hostTerminal":true}` |
 
 `features`: `docker.updates`, `docker.meta`, `disks.state`, `disks.spin`, `mover`, `parity.v2`, `power`,
-`terminal.resize`, `vm.reset`, `vm.ips`, `vm.hostdevs`. `unraid` is `null` if unknown. `hostTerminal` is
+`terminal.resize`, `vm.reset`, `vm.ips`, `vm.hostdevs`, `plugins.list`, `plugins.ops`, `disks.smart`, `files`,
+`mem.breakdown`, `ups.nut`. `unraid` is `null` if unknown. `hostTerminal` is
 `false` when the host terminal is disabled in the plugin settings (the `host` stream then refuses). A 404 means either a protocol-1 plugin or no plugin at all
 (both answer 404 under `/raidman/`); clients tell them apart with the protocol-1 `/connect` probe.
 
@@ -71,9 +72,39 @@ A success response is only sent after Unraid accepted the command.
 | `GET /api/mover/status` | `ARRAY:READ_ANY` | | `{"running":false}` |
 | `POST /api/mover/action` | `ARRAY:UPDATE_ANY` | `{"action":"start"\|"stop"}` | `{"ok":true,"running":bool}` |
 | `POST /api/parity/action` | `ARRAY:UPDATE_ANY` | `{"action":"start"\|"pause"\|"resume"\|"cancel","correct":false}` | `{"ok":true}` |
+| `GET /api/plugins` | `CONFIG:READ_ANY` | | `{"plugins":[{"name","file","version","author?","pluginURL?","support?","icon?","updateAvailable","latestVersion?"}]}` |
+| `POST /api/plugins/check` | `CONFIG:UPDATE_ANY` | | same as `GET /api/plugins`, after `plugin checkall` |
+| `POST /api/plugins/update` | `CONFIG:UPDATE_ANY` | `{"name":"ca.plg"}` | `{"ok":bool,"output":"..."}` (+ `"message"` = output when `ok` is false) |
+| `POST /api/plugins/remove` | `ADMIN` | `{"name":"ca.plg"}` | `{"ok":bool,"output":"..."}` (+ `"message"` when `ok` is false) |
+| `GET /api/disks/smart?device=sdb` | `ARRAY:READ_ANY` | | `{"device","standby","passed","temperature","powerOnHours","attributes":[{"id","name","value","worst","thresh","raw","failing"}]}` |
+| `GET /api/files/list?path=/mnt/user` | `ADMIN` | | `{"path","parent","entries":[{"name","path","type":"dir"\|"file"\|"symlink","size","mtime","targetType"?}],"truncated"?}` |
+| `GET /api/files/download?path=...` | `ADMIN` | | raw bytes (Range supported), `Content-Disposition: attachment` |
+| `GET /api/system/memory` | `INFO:READ_ANY` | | `{"totalBytes","usedBytes","cachedBytes","zfsArcBytes","vmBytes","dockerBytes"}` |
+| `GET /api/ups/nut` | `CONFIG:READ_ANY` | | `{"available":bool,"devices":[{"name","vars":{"ups.status":"OL",...}}]}` |
 | `POST /api/system/action` | `ADMIN` | `{"action":"shutdown"\|"reboot","safeMode":bool?}` | `{"success":true}` (protocol-1 shape) |
 
 Details:
+- **Feature-wave errors** use 422 for a missing entity (plugin, device, path) and for refused plugin
+  operations, 403 for paths outside the allowed roots, 409 while another plugin operation runs and 501 for a missing host tool (`smartctl`, `plugin`).
+  They never answer 404 (reserved for "route missing") or 502–504 (read as "daemon down").
+- **Plugins** are parsed from `/var/log/plugins/*.plg` then `/boot/config/plugins/*.plg` (DOCTYPE entities
+  expanded); `updateAvailable` compares with the `.plg` that `plugin check` leaves in `/tmp/plugins`. Names
+  are matched against the installed list, so client input never reaches argv. Update has a 10 min limit,
+  checks first when no newer `.plg` was downloaded, refuses the OS (`unRAIDServer`) and runs RaidMan's own
+  update detached (output in `/var/log/raidman-update.log`). Remove refuses `dynamix*`, `unRAIDServer` and
+  RaidMan itself. One plugin operation at a time.
+- **SMART** runs `smartctl -n standby -j -H -A /dev/<device>` (device `^(sd[a-z]{1,2}|nvme\d+n\d+)$`); a
+  sleeping disk is never woken (`standby: true`, no attributes). NVMe health-log counters are returned as
+  attributes numbered from 1.
+- **Files** are read-only. Paths are canonicalised (`..` refused, symlinks resolved) and must stay under
+  `/mnt/user`, `/mnt/user0`, `/mnt/disk<N>`, `/mnt/cache`, `/mnt/<pool>` (pools from `/boot/config/pools/*.cfg`)
+  or `/boot`; the opened descriptor is checked again. Directories first, at most 5000 entries; `mtime` is
+  Unix seconds.
+- **Memory**: `/proc/meminfo` (used = total − available, cached = buffers + cache + reclaimable slab), ZFS ARC
+  from `/proc/spl/kstat/zfs/arcstats`, VMs = resident memory of the qemu processes, Docker = the `docker`
+  cgroup minus inactive file cache. Unknown values are `null`.
+- **NUT** uses `upsc -l` / `upsc <ups>` against the local upsd plus the systems on `upsmon.conf` `MONITOR`
+  lines (remote NUT servers). `available` is false when no UPS answered.
 - **Docker updates** come from `/var/lib/docker/unraid-update-status.json`, the file Unraid's Docker
   manager writes. Digests are compared first; otherwise the webGUI status is used (`"true"` = up to date,
   `"false"` = update available, `"undef"` = unknown → `null`). `checkedAt` is the file's modification time

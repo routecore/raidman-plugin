@@ -276,10 +276,10 @@ func TestV2ResponseShapes(t *testing.T) {
 	if err := json.Unmarshal(body, &health); err != nil {
 		t.Fatal(err)
 	}
-	if health.Version != "2026.11.18" || health.Protocol != 2 || health.Unraid == nil || *health.Unraid != "7.2.0" || len(health.Features) != 11 || health.HostTerminal == nil {
+	if health.Version != "2026.11.18" || health.Protocol != 2 || health.Unraid == nil || *health.Unraid != "7.2.0" || len(health.Features) != 17 || health.HostTerminal == nil {
 		t.Fatalf("health = %s", body)
 	}
-	for _, f := range []string{"docker.updates", "docker.meta", "disks.state", "disks.spin", "mover", "parity.v2", "power", "terminal.resize", "vm.reset", "vm.ips", "vm.hostdevs"} {
+	for _, f := range []string{"docker.updates", "docker.meta", "disks.state", "disks.spin", "mover", "parity.v2", "power", "terminal.resize", "vm.reset", "vm.ips", "vm.hostdevs", "plugins.list", "plugins.ops", "disks.smart", "files", "mem.breakdown", "ups.nut"} {
 		if !strings.Contains(string(body), `"`+f+`"`) {
 			t.Errorf("health missing feature %s", f)
 		}

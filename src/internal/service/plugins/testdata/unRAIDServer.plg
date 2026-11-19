@@ -1,0 +1,7 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name "unRAIDServer">
+<!ENTITY version "7.2.0">
+]>
+<PLUGIN name="&name;" version="&version;" pluginURL="https://releases.unraid.net/unRAIDServer.plg">
+</PLUGIN>

@@ -37,6 +37,15 @@ var Features = []string{
 	"vm.reset",
 	"vm.ips",
 	"vm.hostdevs",
+	// Feature wave: GET /api/plugins, POST /api/plugins/check; POST
+	// /api/plugins/update and /remove; GET /api/disks/smart; GET
+	// /api/files/list and /download; GET /api/system/memory; GET /api/ups/nut.
+	"plugins.list",
+	"plugins.ops",
+	"disks.smart",
+	"files",
+	"mem.breakdown",
+	"ups.nut",
 }
 
 // Paths read by /api/health (overridable in tests).

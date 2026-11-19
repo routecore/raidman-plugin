@@ -20,8 +20,10 @@ const (
 const (
 	ResourceAPIKey              = "API_KEY"
 	ResourceArray               = "ARRAY"
+	ResourceConfig              = "CONFIG"
 	ResourceConnectRemoteAccess = "CONNECT__REMOTE_ACCESS"
 	ResourceDocker              = "DOCKER"
+	ResourceInfo                = "INFO"
 	ResourceMe                  = "ME"
 	ResourceVMs                 = "VMS"
 )

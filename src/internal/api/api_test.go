@@ -75,6 +75,17 @@ var contractRoutes = map[string]Requirement{
 	"/api/mover/status":         Perm(auth.ResourceArray, auth.ActionReadAny),
 	"/api/mover/action":         Perm(auth.ResourceArray, auth.ActionUpdateAny),
 	"/api/parity/action":        Perm(auth.ResourceArray, auth.ActionUpdateAny),
+
+	// feature wave
+	"/api/plugins":        Perm(auth.ResourceConfig, auth.ActionReadAny),
+	"/api/plugins/check":  Perm(auth.ResourceConfig, auth.ActionUpdateAny),
+	"/api/plugins/update": Perm(auth.ResourceConfig, auth.ActionUpdateAny),
+	"/api/plugins/remove": AdminOnly(),
+	"/api/disks/smart":    Perm(auth.ResourceArray, auth.ActionReadAny),
+	"/api/files/list":     AdminOnly(),
+	"/api/files/download": AdminOnly(),
+	"/api/system/memory":  Perm(auth.ResourceInfo, auth.ActionReadAny),
+	"/api/ups/nut":        Perm(auth.ResourceConfig, auth.ActionReadAny),
 }
 
 var contractStreams = map[string]Requirement{
@@ -173,12 +184,13 @@ func TestAuthorizationMatrix(t *testing.T) {
 		"admin": nil, // all
 		"viewer": set("/api/vm/info", "/api/vms", "/api/vm/icon", "/novnc/", "/api/array/status",
 			"/api/array/history", "/api/docker/containers", "/connect",
-			"/api/health", "/api/docker/updates", "/api/docker/meta", "/api/disks/state", "/api/mover/status"),
+			"/api/health", "/api/docker/updates", "/api/docker/meta", "/api/disks/state", "/api/mover/status",
+			"/api/plugins", "/api/disks/smart", "/api/system/memory", "/api/ups/nut"),
 		"guest": set("/api/vm/icon", "/novnc/", "/connect", "/api/health"),
 		"perm": set("/api/vm/icon", "/novnc/", "/api/array/status", "/api/array/history",
 			"/api/docker/containers", "/api/docker/action", "/connect",
 			"/api/health", "/api/docker/updates", "/api/docker/updates/check", "/api/docker/meta",
-			"/api/disks/state", "/api/mover/status"),
+			"/api/disks/state", "/api/mover/status", "/api/disks/smart"),
 		"vmops": set("/api/vm/icon", "/novnc/", "/api/vm/autostart", "/api/vm/action", "/connect", "/api/health"),
 		"dockerro": set("/api/vm/icon", "/novnc/", "/connect", "/api/health",
 			"/api/docker/containers", "/api/docker/updates", "/api/docker/meta"),

@@ -90,6 +90,17 @@ func (a *Api) routes() []route {
 		{Path: "/api/mover/action", Methods: post, Req: Perm(auth.ResourceArray, auth.ActionUpdateAny), Handler: a.handleMoverAction, V2: true},
 		{Path: "/api/parity/action", Methods: post, Req: Perm(auth.ResourceArray, auth.ActionUpdateAny), Handler: a.handleParityAction, V2: true},
 
+		// Feature wave (plugins.list, plugins.ops, disks.smart, files, mem.breakdown, ups.nut)
+		{Path: "/api/plugins", Methods: get, Req: Perm(auth.ResourceConfig, auth.ActionReadAny), Handler: a.handlePluginsList, V2: true},
+		{Path: "/api/plugins/check", Methods: post, Req: Perm(auth.ResourceConfig, auth.ActionUpdateAny), Handler: a.handlePluginsCheck, V2: true},
+		{Path: "/api/plugins/update", Methods: post, Req: Perm(auth.ResourceConfig, auth.ActionUpdateAny), Handler: a.handlePluginUpdate, V2: true},
+		{Path: "/api/plugins/remove", Methods: post, Req: AdminOnly(), Handler: a.handlePluginRemove, V2: true},
+		{Path: "/api/disks/smart", Methods: get, Req: Perm(auth.ResourceArray, auth.ActionReadAny), Handler: a.handleDiskSmart, V2: true},
+		{Path: "/api/files/list", Methods: get, Req: AdminOnly(), Handler: a.handleFilesList, V2: true},
+		{Path: "/api/files/download", Methods: get, Req: AdminOnly(), Handler: a.handleFilesDownload, V2: true},
+		{Path: "/api/system/memory", Methods: get, Req: Perm(auth.ResourceInfo, auth.ActionReadAny), Handler: a.handleSystemMemory, V2: true},
+		{Path: "/api/ups/nut", Methods: get, Req: Perm(auth.ResourceConfig, auth.ActionReadAny), Handler: a.handleUpsNut, V2: true},
+
 		// WebSocket streams: authentication here, per-type authorization in
 		// handleConnect against wsRoutes().
 		{Path: "/connect", Req: AnyKey(), Handler: a.handleConnect, CookieAuth: cookieForVNCStream},
