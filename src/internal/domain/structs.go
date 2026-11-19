@@ -171,6 +171,11 @@ type ParityCheckStatus struct {
 	Pos             int64  `json:"pos"`
 	Total           int64  `json:"total"`
 	TimeRemaining   int64  `json:"timeRemaining"` // Estimated Seconds Remaining
+
+	// Errors/ErrorsThisCheck come from sbSyncErrs. Correcting is mdResyncCorr == 1 while a check
+	// runs (false when idle) and is always sent: its presence tells the app the errors are
+	// sbSyncErrs-based (older plugins put the mdResyncCorr flag in Errors).
+	Correcting bool `json:"correcting"`
 }
 
 type ArrayDisk struct {

@@ -93,7 +93,9 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 
 		total = parseInt("mdResyncSize")
 		pos = parseInt("mdResyncPos")
-		errs = parseInt("mdResyncCorr")
+		// sbSyncErrs is the sync error count (what the webGUI and the Unraid API report);
+		// mdResyncCorr is only the 0/1 "correcting" flag of the running operation.
+		errs = parseInt("sbSyncErrs")
 		// NOTE: mdResyncDt is delta time between Unraid updates (~30s), NOT total elapsed.
 		// We calculate actual elapsed from pos/speed later.
 		dur = 0 // Will be calculated from pos/speed if running
@@ -154,10 +156,12 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 		if total > 0 && pos > 0 && pos < total {
 			status.ParityCheckStatus.Running = true
 
-			// Determine Sync vs Check
-			action := varMap["mdResyncAction"]
+			// Correcting (writes parity) vs read-only check. emhttp's mdResyncAction is
+			// "check P", "check P Q", "recon P" or "clear" and never says "corr"/"sync":
+			// the correcting flag is mdResyncCorr.
+			status.ParityCheckStatus.Correcting = parseInt("mdResyncCorr") == 1
 			suffix := "CHECK"
-			if action == "corr" || action == "sync" {
+			if status.ParityCheckStatus.Correcting {
 				suffix = "SYNC"
 			}
 
