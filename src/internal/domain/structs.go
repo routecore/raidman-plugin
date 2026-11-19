@@ -82,10 +82,31 @@ type VmDisk struct {
 }
 
 type VmInterface struct {
-	Mac       string `json:"mac"`
-	Model     string `json:"model"`
-	Network   string `json:"network"`
+	Mac     string `json:"mac"`
+	Model   string `json:"model"`
+	Network string `json:"network"`
+	// IpAddress is this NIC's first usable address (IPv4 preferred), "" if
+	// unknown. Older plugins sent the first IPv4 found for any NIC of the
+	// VM (host ARP table only) on every NIC.
 	IpAddress string `json:"ipAddress"`
+	// IpAddresses lists every usable address of this NIC (IPv4 first; no
+	// loopback/link-local). Present (possibly empty) when
+	// /api/health lists "vm.ips"; older plugins omit it.
+	IpAddresses []string `json:"ipAddresses"`
+}
+
+// VmHostdev is a PCI or USB passthrough device (<devices><hostdev>).
+type VmHostdev struct {
+	Type string `json:"type"` // "pci" | "usb"
+	// Kind is "gpu" (PCI class 0x03), "audio" (0x0403), "usb" (USB device or
+	// PCI USB controller 0x0c03), or null.
+	Kind   *string `json:"kind"`
+	Name   *string `json:"name"`
+	Vendor *string `json:"vendor"`
+	// Address is the host PCI address ("0000:01:00.0"), the USB
+	// "vendor:product" ids ("046d:c52b"), or "bus.device" ("001.004") for a
+	// USB device given by bus address only.
+	Address string `json:"address"`
 }
 
 type VmGraphics struct {
@@ -113,6 +134,9 @@ type VmInfo struct {
 	Disks         []VmDisk      `json:"disks"`
 	Interfaces    []VmInterface `json:"interfaces"`
 	Graphics      []VmGraphics  `json:"graphics"`
+	// Hostdevs is [] when the domain has no passthrough devices and null when
+	// the domain XML could not be read. Protocol-1 plugins omit it.
+	Hostdevs []VmHostdev `json:"hostdevs"`
 }
 
 type AutostartRequest struct {

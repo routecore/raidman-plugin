@@ -15,6 +15,9 @@ import (
 	"github.com/routecore/raidman-plugin/src/internal/service/vm"
 )
 
+// executeVmAction is a variable for tests (never reaches libvirt there).
+var executeVmAction = vm.ExecuteVmAction
+
 // vmIconDir is a variable for tests.
 var vmIconDir = "/usr/local/emhttp/plugins/dynamix.vm.manager/templates/images"
 
@@ -105,9 +108,17 @@ func (a *Api) handleVmAction(w http.ResponseWriter, r *http.Request, k *auth.Key
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := vm.ExecuteVmAction(req.Vm, req.Action); err != nil {
+	if !vm.ValidAction(req.Action) {
+		http.Error(w, "invalid action: "+req.Action, http.StatusBadRequest)
+		return
+	}
+	if err := executeVmAction(req.Vm, req.Action); err != nil {
 		log.Printf("[AUDIT] VM action %q on %q FAILED by key %s: %v", req.Action, req.Vm, k.Label(), err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		status := http.StatusInternalServerError
+		if errors.Is(err, vm.ErrNotRunning) {
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	log.Printf("[AUDIT] VM action %q on %q by key %s", req.Action, req.Vm, k.Label())

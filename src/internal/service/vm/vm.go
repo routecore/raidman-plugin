@@ -92,20 +92,25 @@ func ResolveDomain(ref string) (*Domain, error) {
 	return &Domain{Name: dom.Name, UUID: FormatUUID(dom.UUID)}, nil
 }
 
-func GetVmIp(l *libvirt.Libvirt, dom libvirt.Domain) string {
-	// Source: 2 = Agent
-	ifaces, err := l.DomainInterfaceAddresses(dom, uint32(2), 0)
-	if err == nil {
-		for _, iface := range ifaces {
-			for _, addr := range iface.Addrs {
-				// Type 0 = IPv4
-				if addr.Type == 0 {
-					return addr.Addr
-				}
-			}
-		}
+// stateName maps a libvirt domain state to the plugin's detailedState.
+func stateName(state uint8) string {
+	switch libvirt.DomainState(state) {
+	case libvirt.DomainRunning:
+		return "running"
+	case libvirt.DomainBlocked:
+		return "blocked"
+	case libvirt.DomainPaused:
+		return "paused"
+	case libvirt.DomainShutdown:
+		return "shutdown"
+	case libvirt.DomainShutoff:
+		return "shutoff"
+	case libvirt.DomainCrashed:
+		return "crashed"
+	case libvirt.DomainPmsuspended:
+		return "pmsuspended"
 	}
-	return ""
+	return "unknown"
 }
 
 func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error) {
@@ -119,26 +124,14 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 
 	// Get State & Info
 	state, maxMem, _, nrVirtCpu, cpuTime, err := l.DomainGetInfo(dom)
+	stateKnown := false
 	if err == nil {
 		info.Vcpus = int(nrVirtCpu)
 		info.Memory = int64(maxMem) * 1024 // KB to Bytes
 		info.CpuTime = fmt.Sprintf("%d", cpuTime)
 
-		// Map State
-		switch state {
-		case 1: // RUNNING
-			info.DetailedState = "running"
-		case 3: // PAUSED
-			info.DetailedState = "paused"
-		case 5: // SHUTOFF
-			info.DetailedState = "shutoff"
-		case 6: // CRASHED
-			info.DetailedState = "crashed"
-		case 7: // PMSUSPENDED
-			info.DetailedState = "pmsuspended"
-		default:
-			info.DetailedState = "unknown"
-		}
+		info.DetailedState = stateName(state)
+		stateKnown = true
 	}
 
 	// Autostart
@@ -167,7 +160,13 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 			}
 		}
 
-		// 2. Standard Libvirt Parse
+		// 2. Passthrough devices (own parser: string attributes, strict
+		// address validation, host-side names from sysfs/pci.ids).
+		if refs, err := parseHostdevs(xmlStr); err == nil {
+			info.Hostdevs = resolveHostdevs(refs)
+		}
+
+		// 3. Standard Libvirt Parse
 		var domCfg libvirtxml.Domain
 		if err := xml.Unmarshal([]byte(xmlStr), &domCfg); err == nil {
 			// Description
@@ -212,7 +211,20 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 					})
 				}
 
-				// Interfaces
+				// Interfaces: one address query per source for the whole
+				// domain, matched to each NIC by MAC.
+				var nicIPs map[string][]string
+				if stateKnown && len(domCfg.Devices.Interfaces) > 0 {
+					macs := make([]string, 0, len(domCfg.Devices.Interfaces))
+					for _, i := range domCfg.Devices.Interfaces {
+						if i.MAC != nil {
+							macs = append(macs, i.MAC.Address)
+						}
+					}
+					nicIPs = resolveNICIPs(macs, sourcesForState(state, agentConnected(domCfg.Devices)), func(src libvirt.DomainInterfaceAddressesSource) ([]libvirt.DomainInterface, error) {
+						return l.DomainInterfaceAddresses(dom, uint32(src), 0)
+					})
+				}
 				for _, i := range domCfg.Devices.Interfaces {
 					net := ""
 					if i.Source != nil {
@@ -227,7 +239,14 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 						mac = i.MAC.Address
 					}
 
-					ip := GetVmIp(l, dom)
+					ips := nicIPs[normMAC(mac)]
+					if ips == nil {
+						ips = []string{}
+					}
+					ip := ""
+					if len(ips) > 0 {
+						ip = ips[0]
+					}
 
 					model := ""
 					if i.Model != nil {
@@ -235,10 +254,11 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 					}
 
 					info.Interfaces = append(info.Interfaces, domain.VmInterface{
-						Mac:       mac,
-						Model:     model,
-						Network:   net,
-						IpAddress: ip,
+						Mac:         mac,
+						Model:       model,
+						Network:     net,
+						IpAddress:   ip,
+						IpAddresses: ips,
 					})
 				}
 
@@ -339,7 +359,19 @@ func SetVmAutostart(vmName string, enabled bool) error {
 	return l.DomainSetAutostart(dom, 0)
 }
 
+// Actions accepted by ExecuteVmAction.
+var vmActions = map[string]bool{
+	"start": true, "stop": true, "force-stop": true, "pause": true,
+	"resume": true, "restart": true, "hibernate": true, "reset": true,
+}
+
+// ValidAction reports whether ExecuteVmAction knows the action.
+func ValidAction(action string) bool { return vmActions[action] }
+
 func ExecuteVmAction(vmName string, action string) error {
+	if !ValidAction(action) {
+		return fmt.Errorf("invalid action: %s", action)
+	}
 	l, err := connect()
 	if err != nil {
 		return err
@@ -367,9 +399,89 @@ func ExecuteVmAction(vmName string, action string) error {
 	case "hibernate":
 		// DomainPmSuspendForDuration
 		return l.DomainPmSuspendForDuration(dom, 1, 0, 0)
+	case "reset":
+		return resetDomain(l, dom)
 	default:
 		return fmt.Errorf("invalid action: %s", action)
 	}
+}
+
+// resetConn is the part of *libvirt.Libvirt that resetDomain uses (a fake
+// in tests).
+type resetConn interface {
+	DomainGetState(dom libvirt.Domain, flags uint32) (int32, int32, error)
+	DomainReset(dom libvirt.Domain, flags uint32) error
+	DomainIsPersistent(dom libvirt.Domain) (int32, error)
+	DomainDestroy(dom libvirt.Domain) error
+	DomainCreate(dom libvirt.Domain) error
+}
+
+// isUnsupported reports libvirt's "not supported by this hypervisor/driver"
+// errors, the only ones after which the destroy+create fallback is used.
+func isUnsupported(err error) bool {
+	// go-libvirt turns libvirtd's "unknown procedure" (an RPC this daemon
+	// does not have) into the ErrUnsupported sentinel, not a libvirt.Error.
+	if errors.Is(err, libvirt.ErrUnsupported) {
+		return true
+	}
+	var le libvirt.Error
+	if !errors.As(err, &le) {
+		return false
+	}
+	switch libvirt.ErrorNumber(le.Code) {
+	case libvirt.ErrNoSupport, libvirt.ErrArgumentUnsupported, libvirt.ErrOperationUnsupported:
+		return true
+	}
+	return false
+}
+
+// resetDomain performs a hard reset (like pressing the reset button; the
+// guest OS is not asked). The domain must be active (ErrNotRunning
+// otherwise). If the hypervisor does not support virDomainReset and the VM
+// was running, it falls back to destroy + create, but only for persistent
+// domains: destroying a transient domain would delete it.
+//
+// A crashed domain (on_crash="preserve": the QEMU process is kept) is reset
+// with destroy + create directly, again only when persistent. That is what
+// the official API's resetVm does in every state, and the app offers reset
+// for crashed VMs; virDomainReset would leave such a guest paused.
+func resetDomain(c resetConn, dom libvirt.Domain) error {
+	state, _, err := c.DomainGetState(dom, 0)
+	if err != nil {
+		return err
+	}
+	st := libvirt.DomainState(state)
+	switch st {
+	case libvirt.DomainRunning, libvirt.DomainBlocked, libvirt.DomainPaused:
+	case libvirt.DomainCrashed:
+		return destroyAndCreate(c, dom, errors.New("the VM crashed"))
+	default:
+		return ErrNotRunning
+	}
+	err = c.DomainReset(dom, 0)
+	if err == nil || !isUnsupported(err) {
+		return err
+	}
+	if st != libvirt.DomainRunning && st != libvirt.DomainBlocked {
+		return err
+	}
+	return destroyAndCreate(c, dom, err)
+}
+
+// destroyAndCreate force-stops and starts a persistent domain; why says in
+// the error why a plain virDomainReset was not used.
+func destroyAndCreate(c resetConn, dom libvirt.Domain, why error) error {
+	persistent, perr := c.DomainIsPersistent(dom)
+	if perr != nil || persistent != 1 {
+		return fmt.Errorf("cannot reset (%w) and the VM is not persistent, so it is not force-stopped and started again", why)
+	}
+	if err := c.DomainDestroy(dom); err != nil {
+		return fmt.Errorf("reset fallback: force stop failed: %w", err)
+	}
+	if err := c.DomainCreate(dom); err != nil {
+		return fmt.Errorf("reset fallback: the VM was stopped but could not be started again: %w", err)
+	}
+	return nil
 }
 
 func GetVncPort(vmName string) (string, error) {

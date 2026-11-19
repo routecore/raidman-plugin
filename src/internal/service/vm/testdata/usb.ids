@@ -1,0 +1,11 @@
+# usb.ids test excerpt
+
+046d  Logitech, Inc.
+	c52b  Unifying Receiver
+	c534  Unifying Receiver
+1d6b  Linux Foundation
+	0002  2.0 root hub
+
+C 00  (Defined at Interface level)
+C 03  Human Interface Device
+	01  Boot Interface Subclass

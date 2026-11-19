@@ -32,6 +32,11 @@ var Features = []string{
 	"parity.v2",
 	"power",
 	"terminal.resize",
+	// VM additions: POST /api/vm/action {"action":"reset"}; per-NIC
+	// interfaces[].ipAddresses; hostdevs[] on /api/vm/info and /api/vms.
+	"vm.reset",
+	"vm.ips",
+	"vm.hostdevs",
 }
 
 // Paths read by /api/health (overridable in tests).

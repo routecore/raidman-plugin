@@ -55,7 +55,8 @@ A success response is only sent after Unraid accepted the command.
 | `GET /api/health` | any valid key | `{"version":"2026.11.18","protocol":2,"features":[...],"unraid":"7.2.0","hostTerminal":true}` |
 
 `features`: `docker.updates`, `docker.meta`, `disks.state`, `disks.spin`, `mover`, `parity.v2`, `power`,
-`terminal.resize`. `unraid` is `null` if unknown. A 404 means either a protocol-1 plugin or no plugin at all
+`terminal.resize`, `vm.reset`, `vm.ips`, `vm.hostdevs`. `unraid` is `null` if unknown. `hostTerminal` is
+`false` when the host terminal is disabled in the plugin settings (the `host` stream then refuses). A 404 means either a protocol-1 plugin or no plugin at all
 (both answer 404 under `/raidman/`); clients tell them apart with the protocol-1 `/connect` probe.
 
 ### Protocol-2 routes
@@ -105,6 +106,35 @@ Details:
 - **Power**: shutdown/reboot run `/sbin/poweroff` / `/sbin/reboot` without `-f`, which hand over to init so
   Unraid's shutdown script stops services and the array cleanly (the same path as the webGUI buttons).
   `safeMode` (optional) sets or clears `/boot/unraidsafemode`; omitted leaves it unchanged.
+
+### VM additions (protocol-1 routes, new optional fields)
+
+| Route | Permission | Change |
+|---|---|---|
+| `POST /api/vm/action` | `VMS:UPDATE_ANY` | new action `reset` (feature `vm.reset`); unknown actions → `400`; `reset` on a VM that is not running → `409` |
+| `GET /api/vm/info`, `GET /api/vms` | `VMS:READ_ANY` | `interfaces[].ipAddresses` (feature `vm.ips`), `hostdevs[]` (feature `vm.hostdevs`), `detailedState` `blocked` / `shutdown` |
+
+- **reset** is a hard reset (`virDomainReset`, like the reset button; the guest is not asked). Allowed while
+  the VM is running, idle (`blocked`) or paused. Only if the hypervisor reports reset as unsupported and the VM
+  is running/idle and persistent, the plugin force-stops and starts it instead. A `crashed` VM is force-stopped
+  and started again (persistent VMs only, like the official API's `resetVm`); any other state → `409`. Errors stay
+  plain text (protocol-1 route); success is `{"success":true}`.
+- **IPs per NIC**: one `DomainInterfaceAddresses` query per source for the whole VM, in the order guest agent
+  (only when the agent channel is connected), DHCP lease, host ARP table; a source is asked only while some NIC
+  still has no address. Addresses are matched to each NIC by MAC; loopback, link-local, unspecified and multicast
+  addresses are dropped; IPv4 comes first. `ipAddresses` is `[]` when nothing is known (always `[]` for a shut-off
+  or other inactive VM; a paused VM is asked via lease/ARP only); `ipAddress` is its first entry or `""`. Older plugins sent the first IPv4 of any NIC (from
+  the host ARP table) on every NIC.
+- **hostdevs**: PCI and USB passthrough devices from `<devices><hostdev mode="subsystem">`:
+  `[{"type":"pci"|"usb","kind":"gpu"|"audio"|"usb"|null,"name":string|null,"vendor":string|null,"address":string}]`.
+  `address` is the host PCI address (`0000:01:00.0`), the USB `vendor:product` ids (`046d:c52b`), or
+  `bus.device` (`001.004`) for a USB device given by bus address. `kind` comes from the PCI class in sysfs
+  (`0x03xxxx` → `gpu`, `0x0403xx` → `audio`, `0x0c03xx` USB controller → `usb`; every USB device is `usb`).
+  Names come from `/sys/bus/pci/devices/<address>/{vendor,device}` and `pci.ids` / `usb.ids`
+  (`/usr/share/hwdata` or `/usr/share/misc`); nothing is executed. `hostdevs` is `[]` without passthrough
+  devices and `null` if the domain XML could not be read.
+- **States** (`detailedState`): `running`, `blocked` (libvirt idle), `paused`, `shutdown` (shutting down),
+  `shutoff`, `crashed`, `pmsuspended`, `unknown`.
 
 ### WebSocket streams (`/connect?type=...`)
 
