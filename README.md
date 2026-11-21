@@ -20,20 +20,29 @@ Remote management plugin for Unraid servers, providing real-time monitoring and 
 1. Install via Unraid Community Applications (or use URL: `https://raw.githubusercontent.com/routecore/raidman-plugin/main/raidman.plg`)
 2. Go to **Settings → Management Access → API Keys**
 3. Create a key. Either give it a role (`ADMIN` for everything, `VIEWER` for read-only access) or grant permissions per resource:
-   - `DOCKER`: `READ_ANY` (containers, stats, logs), `UPDATE_ANY` (start/stop, container console)
-   - `VMS`: `READ_ANY` (VM list, details, logs), `UPDATE_ANY` (start/stop, autostart, VNC, serial console)
+   - `DOCKER`: `READ_ANY` (containers, stats, logs), `UPDATE_ANY` (start/stop, update check)
+   - `VMS`: `READ_ANY` (VM list, details, logs), `UPDATE_ANY` (start/stop, autostart, VNC)
    - `ARRAY`: `READ_ANY` (array status, parity history, disk spin state, mover status), `UPDATE_ANY` (parity check, spin up/down, mover)
+   - `DISK`: `READ_ANY` (SMART data)
+   - `CONFIG`: `READ_ANY` (plugin list, NUT UPS status), `UPDATE_ANY` (plugin update check and update)
+   - `INFO`: `READ_ANY` (memory breakdown)
 
 > [!NOTE]
-> The host terminal and shutdown/reboot require the **ADMIN** role. VNC requires `VMS: UPDATE_ANY`.
+> The host terminal, container console (`docker exec`), VM serial console, file browser, plugin removal and shutdown/reboot require the **ADMIN** role. VNC requires `VMS: UPDATE_ANY`.
+> The file browser never serves password hashes, private keys or API key secrets from `/boot` (see the [Security Guide](SECURITY.md#file-browser)).
 > Permissions are checked exactly like the Unraid API does: a `GUEST` key can only read its own profile, `UPDATE_ANY` does not imply `READ_ANY`, and `*_OWN` does not imply `*_ANY`.
 
 ## Service
 - `/etc/rc.d/rc.raidman {start|stop|restart|status}`
 - The daemon listens on `127.0.0.1:9876`; nginx proxies `/raidman/` to it.
+- `start` runs the daemon under a small supervisor that restarts it after a crash (backoff 2 s doubling to 60 s,
+  reset after a minute of uptime; logged as `[SUPERVISOR]`). `stop` ends both, and a clean exit is not restarted.
+  `start` reports success only once the daemon itself listens on the port. The daemon runs in `/` with `HOME=/root`.
+- If nginx rejects its configuration when RaidMan installs, the daemon adds its include once `nginx -t` passes
+  (checked every minute and whenever `locations.conf` changes).
 
 ## Monitoring & Troubleshooting
-- **Logs**: `tail -f /var/log/raidman.log` (rotated at 5 MB on service start)
+- **Logs**: `tail -f /var/log/raidman.log` (kept under 5 MB by Unraid's logrotate via `/etc/logrotate.d/raidman`; one old copy in `raidman.log.1`)
 - **Security Events**: `grep -E "AUDIT|SECURITY" /var/log/raidman.log`
 - Keys that cannot be parsed are logged with `[AUTH]`.
 
@@ -41,10 +50,11 @@ Remote management plugin for Unraid servers, providing real-time monitoring and 
 
 All routes are served under `/raidman/` by nginx (proxied to `127.0.0.1:9876`) and require the
 `x-api-key` header. Protocol-1 routes keep their request/response shapes and plain-text errors.
-Protocol-2 routes answer JSON; every error (including 401/403/405) is `{"error": "<message>"}`.
+Protocol-2 routes answer JSON; every error (including 401/403/405) is `{"error": "<message>", "code"?: "<code>"}`.
 
 Status codes: `401` missing/invalid key, `403` key lacks the permission, `405` wrong method,
-`400` invalid request, `404` unknown disk/container, `409` wrong state (e.g. pausing a parity check
+`400` invalid request, `422` with `"code":"not_found"` unknown disk/container (a `404` only means the route
+does not exist, i.e. an older plugin), `409` wrong state (e.g. pausing a parity check
 that is not running), `500` the underlying Unraid command failed, `501` feature not available on this server.
 A success response is only sent after Unraid accepted the command.
 
@@ -55,8 +65,8 @@ A success response is only sent after Unraid accepted the command.
 | `GET /api/health` | any valid key | `{"version":"2026.11.18","protocol":2,"features":[...],"unraid":"7.2.0","hostTerminal":true}` |
 
 `features`: `docker.updates`, `docker.meta`, `disks.state`, `disks.spin`, `mover`, `parity.v2`, `power`,
-`terminal.resize`, `vm.reset`, `vm.ips`, `vm.hostdevs`, `plugins.list`, `plugins.ops`, `disks.smart`, `files`,
-`mem.breakdown`, `ups.nut`. `unraid` is `null` if unknown. `hostTerminal` is
+`terminal.resize`, `vm.reset`, `vm.ips`, `vm.hostdevs`, `plugins.list`, `plugins.ops`, `disks.smart`,
+`disks.smart.disk` (SMART requires `DISK:READ_ANY`; older plugins required `ARRAY:READ_ANY`), `files`, `mem.breakdown`, `ups.nut`. `unraid` is `null` if unknown. `hostTerminal` is
 `false` when the host terminal is disabled in the plugin settings (the `host` stream then refuses). A 404 means either a protocol-1 plugin or no plugin at all
 (both answer 404 under `/raidman/`); clients tell them apart with the protocol-1 `/connect` probe.
 
@@ -76,8 +86,8 @@ A success response is only sent after Unraid accepted the command.
 | `POST /api/plugins/check` | `CONFIG:UPDATE_ANY` | | same as `GET /api/plugins`, after `plugin checkall` |
 | `POST /api/plugins/update` | `CONFIG:UPDATE_ANY` | `{"name":"ca.plg"}` | `{"ok":bool,"output":"..."}` (+ `"message"` = output when `ok` is false) |
 | `POST /api/plugins/remove` | `ADMIN` | `{"name":"ca.plg"}` | `{"ok":bool,"output":"..."}` (+ `"message"` when `ok` is false) |
-| `GET /api/disks/smart?device=sdb` | `ARRAY:READ_ANY` | | `{"device","standby","passed","temperature","powerOnHours","attributes":[{"id","name","value","worst","thresh","raw","failing"}]}` |
-| `GET /api/files/list?path=/mnt/user` | `ADMIN` | | `{"path","parent","entries":[{"name","path","type":"dir"\|"file"\|"symlink","size","mtime","targetType"?}],"truncated"?}` |
+| `GET /api/disks/smart?device=sdb` | `DISK:READ_ANY` | | `{"device","standby","passed","temperature","powerOnHours","attributes":[{"id","name","value","worst","thresh","raw","failing"}]}` |
+| `GET /api/files/list?path=/mnt/user` (`&offset=&limit=` optional) | `ADMIN` | | `{"path","parent","entries":[{"name","path","type":"dir"\|"file"\|"symlink","size","mtime","targetType"?,"protected"?}],"total","truncated"?,"offset"?,"next"?,"incomplete"?}` (`protected`: a denied `/boot` path, listed but never opened) |
 | `GET /api/files/download?path=...` | `ADMIN` | | raw bytes (Range supported), `Content-Disposition: attachment` |
 | `GET /api/system/memory` | `INFO:READ_ANY` | | `{"totalBytes","usedBytes","cachedBytes","zfsArcBytes","vmBytes","dockerBytes"}` |
 | `GET /api/ups/nut` | `CONFIG:READ_ANY` | | `{"available":bool,"devices":[{"name","vars":{"ups.status":"OL",...}}]}` |
@@ -98,8 +108,11 @@ Details:
   attributes numbered from 1.
 - **Files** are read-only. Paths are canonicalised (`..` refused, symlinks resolved) and must stay under
   `/mnt/user`, `/mnt/user0`, `/mnt/disk<N>`, `/mnt/cache`, `/mnt/<pool>` (pools from `/boot/config/pools/*.cfg`)
-  or `/boot`; the opened descriptor is checked again. Directories first, at most 5000 entries; `mtime` is
-  Unix seconds.
+  or `/boot`; the opened descriptor is checked again. Directories first, at most 5000 entries per page; `mtime` is
+  Unix seconds. On `/boot`, `config/shadow`, `config/passwd`, `config/smbpasswd`, `config/ssh`, `config/ssl`,
+  `config/wireguard`, `config/plugins/dynamix.my.servers` and `config/plugins/raidman/settings.json` (and
+  everything below them) are refused with `403`; they are matched by file identity, so case variants and
+  symlinks are refused too.
 - **Memory**: `/proc/meminfo` (used = total − available, cached = buffers + cache + reclaimable slab), ZFS ARC
   from `/proc/spl/kstat/zfs/arcstats`, VMs = resident memory of the qemu processes, Docker = the `docker`
   cgroup minus inactive file cache. Unknown values are `null`.
@@ -174,9 +187,10 @@ Details:
 | `array-status` | `ARRAY:READ_ANY` | |
 | `docker-stats` | `DOCKER:READ_ANY` | `container` (optional) |
 | `docker-log` | `DOCKER:READ_ANY` | `container` |
-| `docker` (exec) | `DOCKER:UPDATE_ANY` | `container`, `shell` (optional: `sh` default, `bash`, `ash`, `zsh`; anything else → error frame) |
+| `docker` (exec) | `ADMIN` | `container`, `shell` (optional: `sh` default, `bash`, `ash`, `zsh`; anything else → error frame) |
 | `vm-log` | `VMS:READ_ANY` | `vm` |
-| `vm` (serial) / `vm-vnc` | `VMS:UPDATE_ANY` | `vm` (name or UUID) |
+| `vm` (serial) | `ADMIN` | `vm` (name or UUID) |
+| `vm-vnc` | `VMS:UPDATE_ANY` | `vm` (name or UUID) |
 | `host` | `ADMIN` (and enabled in settings) | |
 
 Container ids may be raw Docker ids, names, or Unraid API PrefixedIDs (`<serverId>:<id>`).
@@ -188,6 +202,57 @@ lists `terminal.resize`.
 
 Sockets accept messages up to 64 KiB (4 MiB for VNC), ping every 30 s, and are closed with code `1008`
 when the key is deleted or loses the permission.
+
+## Development checks
+The CI workflow runs these; all but `test-rc.sh` also work locally (`xmllint`, GNU tar for packaging):
+- `go vet ./... && go test -race ./...`
+- `scripts/check-plg.sh`: `raidman.plg`, `raidman.xml` and `ca_profile.xml` are well-formed, the plg's entities
+  resolve, every downloaded `<FILE>` has a SHA-256, and the inline install/remove scripts and all shell scripts
+  pass `bash -n` (and shellcheck when installed). `--allow-unstamped` accepts an empty SHA-256.
+- `scripts/build.sh <version> [out]`: the release binary (linux/amd64, `CGO_ENABLED=0`, version via `-ldflags`),
+  smoke-tested with `-version` on linux/amd64.
+- `NOVNC_VERSION=… NOVNC_SHA256=… scripts/package.sh <version> <binary> <outdir>`: the reproducible package
+  (values from the workflow), then `scripts/check-package.sh <tgz>` checks it holds exactly what the install
+  script expects.
+- `scripts/test-rc.sh <linux binary>` (Linux only): start, crash restart, stop and double start of `rc.raidman`.
+- `scripts/check-released.sh` (needs network): downloads the package `raidman.plg` points at, checks its
+  SHA-256 and runs `check-package.sh` on it with this plg, so a change to the install script on `main` cannot
+  break installs of the current release.
+
+## Releasing
+The release tag is the plugin version (`YYYY.MM.DD`, or `YYYY.MM.DDa` for a second release on one day).
+Nobody edits `<!ENTITY version>` or `<!ENTITY sha256>` in `raidman.plg` by hand: the copy on `main` always
+describes the last published package, because installed servers and Community Applications read it there.
+
+1. In a normal pull request, add `<CHANGE>YYYY.MM.DD - what changed</CHANGE>` at the top of `<CHANGES>` in
+   `raidman.plg` (the release fails without an entry for its tag) and update `<Date>` in `raidman.xml`.
+   Merge it once CI is green.
+2. Tag the commit on `main` and push the tag: `git tag 2026.12.01 && git push origin 2026.12.01`.
+3. The release job then:
+   - checks the tag format, the `<CHANGE>` entry, that `main` is not already at a newer version, and whether the
+     release already exists;
+   - builds the binary and the reproducible package (fixed mtime, sorted, owner 0, `gzip -n`, noVNC included);
+   - stamps the tag and the package SHA-256 into `raidman.plg`, publishes the release with the package, its
+     `.sha256` and the stamped `raidman.plg` (an existing release is never overwritten). The release notes end
+     with `Source commit: <sha>`, the tagged commit the package was built from; do not edit that line;
+   - downloads the published package, checks its SHA-256, and commits the two stamped lines to `main`'s own
+     `raidman.plg` (retrying on push races). It does so only if the tagged commit is an ancestor of `main`, or
+     `main` differs from it only in `raidman.plg`.
+4. If the job fails after publishing (for example the push to `main` was rejected, or the run was cancelled
+   while the release was still a draft), re-run it. It reuses the published package only if the release notes
+   name the same commit (`Source commit:`) and the package passes `scripts/check-package.sh`; it uploads a
+   missing `.sha256` or `raidman.plg` asset, publishes a leftover draft, and stamps `main`. A release made by
+   hand, by an older workflow, or for a tag that has since moved is refused: to change a published package,
+   release a new tag.
+
+A pull request that makes the install script need a new file (a new `REQUIRED_FILES` entry) cannot pass the
+"Install script fits the released package" step, because the current release lacks that file. Release it from
+the pull request's head as described next instead of merging it first.
+
+A tag that is not on `main` still publishes its release, but `main` is not stamped, so no server is offered
+the update. That is also how the first release of this packaging is bootstrapped: tag the pull request's head,
+copy the two stamped lines from the release's `raidman.plg` into the pull request (its strict `check-plg`
+step fails until then), then merge it.
 
 ## Support
 - **Issues**: [GitHub Issues](https://github.com/routecore/raidman-plugin/issues)

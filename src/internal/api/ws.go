@@ -50,7 +50,7 @@ var cookieUpgrader = websocket.Upgrader{
 		if isSafeOrigin(r) {
 			return true
 		}
-		log.Printf("[SECURITY] WS Blocked Origin: %s", r.Header.Get("Origin"))
+		log.Printf("[SECURITY] WS Blocked Origin %q from %q", truncate(r.Header.Get("Origin"), 128), truncate(clientIP(r), 64))
 		return false
 	},
 }
@@ -110,11 +110,14 @@ type wsConn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wmu    sync.Mutex
+	// remote is the client address for logs (X-Real-IP from nginx; the
+	// socket peer is always nginx on loopback).
+	remote string
 }
 
-func newWSConn(parent context.Context, c *websocket.Conn, readLimit int64) *wsConn {
+func newWSConn(parent context.Context, c *websocket.Conn, readLimit int64, remote string) *wsConn {
 	ctx, cancel := context.WithCancel(parent)
-	w := &wsConn{c: c, ctx: ctx, cancel: cancel}
+	w := &wsConn{c: c, ctx: ctx, cancel: cancel, remote: truncate(remote, 64)}
 	c.SetReadLimit(readLimit)
 	_ = c.SetReadDeadline(time.Now().Add(pongWait))
 	c.SetPongHandler(func(string) error {
@@ -203,7 +206,7 @@ func (w *wsConn) pingLoop() {
 			return
 		case <-t.C:
 			if err := w.c.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
-				log.Printf("Ping failed to %s: %v", w.c.RemoteAddr(), err)
+				log.Printf("Ping failed to %q: %v", w.remote, err)
 				w.cancel()
 				return
 			}
@@ -215,9 +218,20 @@ func (w *wsConn) pingLoop() {
 // (125-byte payload minus the 2-byte status code).
 const maxCloseReason = 123
 
+// closeGrace is how long closeWith waits for the peer to answer the close
+// frame before dropping the connection.
+const closeGrace = 2 * time.Second
+
 // closeWith sends a close frame with a reason and ends the connection. The
 // reason is truncated (on a UTF-8 boundary) to fit a control frame; a longer
 // one would make gorilla refuse to send the close frame at all.
+//
+// It then waits (up to closeGrace) for the peer's closing frame, which the
+// connection's reader turns into a cancelled context, so the TCP close does
+// not race the close frame (closing with unread input pending can reset the
+// connection and the peer may never see the frame). The caller must have a
+// reader running on the connection (a stream's input loop or drain);
+// without one the wait simply times out.
 func (w *wsConn) closeWith(code int, reason string) {
 	if len(reason) > maxCloseReason {
 		cut := maxCloseReason
@@ -226,7 +240,15 @@ func (w *wsConn) closeWith(code int, reason string) {
 		}
 		reason = reason[:cut]
 	}
-	_ = w.c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(writeWait))
+	err := w.c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(writeWait))
+	if err == nil {
+		t := time.NewTimer(closeGrace)
+		select {
+		case <-w.ctx.Done():
+		case <-t.C:
+		}
+		t.Stop()
+	}
 	w.cancel()
 }
 
@@ -242,7 +264,7 @@ func (w *wsConn) watchAuth(check func() error) {
 			return
 		case <-t.C:
 			if err := check(); err != nil {
-				log.Printf("[SECURITY] Closing session from %s: %v", w.c.RemoteAddr(), err)
+				log.Printf("[SECURITY] Closing session from %q: %v", w.remote, err)
 				w.closeWith(websocket.ClosePolicyViolation, err.Error())
 				return
 			}

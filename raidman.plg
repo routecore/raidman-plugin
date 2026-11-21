@@ -2,9 +2,11 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "raidman">
 <!ENTITY author    "Routecore">
-<!-- version and sha256 are stamped by the release workflow
-     (.github/workflows/build-plugin.yml) from the tagged build; the package
-     and this file always come from the same tag. -->
+<!-- Do not edit version or sha256 by hand. The release workflow
+     (.github/workflows/build-plugin.yml) sets version to the pushed tag and
+     sha256 to the SHA-256 of that tag's package, publishes the release and
+     then commits both lines to main, so the copy on main always describes a
+     published package. See "Releasing" in README.md. -->
 <!ENTITY version   "2026.11.18">
 <!ENTITY sha256    "">
 <!ENTITY launch    "Settings/raidman">
@@ -17,15 +19,15 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" icon="icon.png" min="7.0.0" support="&gitURL;/issues">
 
 <CHANGES>
-<CHANGE>2026.11.18 - Unraid API key compatibility (roles and permission-scoped keys), deny-by-default permission checks, VNC/terminal stability, correct parity pause/resume and spin up/down, Unraid 7.3 boot device, versioned and checksummed package, rc.raidman service script. Protocol 2: health/feature discovery, Docker update status and template metadata (WebUI, icon, shell), spin-safe disk state, per-disk spin, mover start/stop, explicit parity actions, clean shutdown/reboot, terminal resize and docker exec shell choice</CHANGE>
+<CHANGE>2026.11.18 - Unraid API key compatibility (roles and permission-scoped keys), deny-by-default permission checks, VNC/terminal stability, correct parity pause/resume and spin up/down, Unraid 7.3 boot device, versioned and checksummed package (noVNC included), rc.raidman service script with crash restart, log rotation. Protocol 2: health/feature discovery, Docker update status and template metadata (WebUI, icon, shell), spin-safe disk state, per-disk spin, mover start/stop, explicit parity actions, clean shutdown/reboot, terminal resize and docker exec shell choice, plugin list/update/remove, SMART data, read-only file browser (ADMIN; secrets on the flash drive are refused), memory breakdown, NUT UPS status. The container console and the VM serial console now require the ADMIN role</CHANGE>
 <CHANGE>2026.06.21 - Array disk filesystem usage, spin state, and improved I/O stats</CHANGE>
 <CHANGE>2026.06.14 - Bug fixes and robustness improvements</CHANGE>
 <CHANGE>2026.02.10 - Initial Release</CHANGE>
 </CHANGES>
 
 <!--
-Versioned package (binary, settings page, nginx snippet, rc script, icon),
-verified by SHA-256. A new version always has a new file name, so the plugin
+Versioned package (binary, settings page, nginx snippet, rc script, icon,
+noVNC), verified by SHA-256. A new version always has a new file name, so the plugin
 manager never reuses a stale copy from the flash drive.
 -->
 <FILE Name="&plgDir;/&pkgName;">
@@ -48,6 +50,8 @@ NGINX=/usr/sbin/nginx
 LOCATIONS=/etc/nginx/conf.d/locations.conf
 NGINX_CONF=/etc/nginx/conf.d/raidman.conf
 INCLUDE_LINE="include /etc/nginx/conf.d/raidman.conf;"
+# Every file the package must contain (scripts/check-package.sh reads this line).
+REQUIRED_FILES="raidman raidman.page raidman.conf rc.raidman icon.png web/novnc/vnc.html"
 
 echo "Installing RaidMan $VERSION..."
 
@@ -88,7 +92,7 @@ if ! tar -xzf "$PKG" -C "$TMP"; then
   rm -rf "$TMP"
   exit 1
 fi
-for f in raidman raidman.page raidman.conf rc.raidman; do
+for f in $REQUIRED_FILES; do
   if [ ! -f "$TMP/$f" ]; then
     echo "ERROR: package is incomplete ($f missing)"
     rm -rf "$TMP"
@@ -105,9 +109,32 @@ install -m 0755 "$TMP/rc.raidman" /etc/rc.d/rc.raidman
 mkdir -p "$EMHTTP"
 install -m 0755 "$TMP/raidman" "$EMHTTP/raidman"
 install -m 0644 "$TMP/raidman.page" "$EMHTTP/raidman.page"
-if [ -f "$TMP/icon.png" ]; then
-  install -m 0644 "$TMP/icon.png" "$EMHTTP/icon.png"
+install -m 0644 "$TMP/icon.png" "$EMHTTP/icon.png"
+
+# noVNC for the in-app VM console, pinned and covered by the package SHA-256
+# (replaced on every install, never taken from the OS or downloaded).
+rm -rf "$EMHTTP/web/novnc"
+mkdir -p "$EMHTTP/web"
+if ! cp -R "$TMP/web/novnc" "$EMHTTP/web/novnc"; then
+  echo "WARNING: could not install noVNC; everything except the in-app VM console works."
 fi
+
+# -------------------------------------------------
+# Log rotation: Unraid's periodic logrotate run keeps /var/log/raidman.log
+# (on the small /var/log tmpfs) under 5 MB while the daemon runs.
+# copytruncate is safe: the daemon's log is opened with O_APPEND.
+# -------------------------------------------------
+cat > /etc/logrotate.d/raidman <<'LOGROTATE'
+/var/log/raidman.log {
+    size 5M
+    rotate 1
+    copytruncate
+    missingok
+    notifempty
+    nocompress
+}
+LOGROTATE
+chmod 0644 /etc/logrotate.d/raidman
 
 # -------------------------------------------------
 # Nginx: install the location snippet and include it from locations.conf.
@@ -115,7 +142,8 @@ fi
 # roll back only if *our* change makes nginx -t fail. If nginx is not ready
 # (locations.conf not generated yet, or already broken by something else) the
 # snippet is installed and the daemon's nginx monitor adds the include once
-# nginx -t passes.
+# nginx -t passes (it re-checks every minute and whenever locations.conf
+# changes).
 # -------------------------------------------------
 echo "Configuring nginx..."
 if [ ! -f "$LOCATIONS" ] || ! PRECHECK=$($NGINX -t 2>&1); then
@@ -125,7 +153,7 @@ if [ ! -f "$LOCATIONS" ] || ! PRECHECK=$($NGINX -t 2>&1); then
   else
     echo "WARNING: nginx configuration is currently invalid (not caused by RaidMan):"
     echo "$PRECHECK"
-    echo "RaidMan will add its include once nginx -t passes."
+    echo "RaidMan re-checks every minute and adds its include once nginx -t passes."
   fi
 else
   CONF_BACKUP=""
@@ -171,40 +199,9 @@ find "$PLGDIR" -maxdepth 1 -type f -name 'raidman-*.tgz' ! -name "raidman-$VERSI
 rm -f "$PLGDIR/raidman" "$PLGDIR/raidman.page" "$PLGDIR/raidman.conf" "$PLGDIR/icon.png"
 
 # -------------------------------------------------
-# Start the service (before the optional noVNC step, so a download problem
-# never leaves the plugin without its daemon)
+# Start the service (supervised: restarted with a backoff if it crashes)
 # -------------------------------------------------
 /etc/rc.d/rc.raidman start
-
-# -------------------------------------------------
-# noVNC for the in-app VM console (optional)
-# -------------------------------------------------
-NOVNC_VERSION="1.6.0"
-NOVNC_SHA256="5066103959ef4e9b10f37e5a148627360dd8414e4cf8a7db92bdbd022e728aaa"
-NOVNC_DIR="$EMHTTP/web/novnc"
-STOCK_NOVNC="/usr/local/emhttp/plugins/dynamix.vm.manager/novnc"
-mkdir -p "$EMHTTP/web"
-if [ -f "$NOVNC_DIR/vnc.html" ]; then
-  echo "noVNC already present"
-elif rm -rf "$NOVNC_DIR" && [ -f "$STOCK_NOVNC/vnc.html" ] && cp -r "$STOCK_NOVNC" "$NOVNC_DIR" && [ -f "$NOVNC_DIR/vnc.html" ]; then
-  echo "noVNC copied from the VM manager"
-else
-  rm -rf "$NOVNC_DIR"
-  echo "Fetching noVNC v${NOVNC_VERSION}..."
-  NOVNC_TMP=$(mktemp -d /tmp/raidman-novnc.XXXXXX)
-  # Bounded: this also runs at boot, possibly before the network is up.
-  if wget -q --timeout=20 --tries=2 "https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz" -O "$NOVNC_TMP/novnc.tar.gz" \
-    && [ "$(sha256sum "$NOVNC_TMP/novnc.tar.gz" | awk '{print $1}')" = "$NOVNC_SHA256" ] \
-    && tar -xzf "$NOVNC_TMP/novnc.tar.gz" -C "$NOVNC_TMP" \
-    && [ -f "$NOVNC_TMP/noVNC-${NOVNC_VERSION}/vnc.html" ] \
-    && mv "$NOVNC_TMP/noVNC-${NOVNC_VERSION}" "$NOVNC_DIR"; then
-    echo "noVNC installed"
-  else
-    echo "WARNING: could not install noVNC (download or checksum failed)."
-    echo "  Everything except the in-app VM console works; reinstall the plugin to retry."
-  fi
-  rm -rf "$NOVNC_TMP"
-fi
 
 echo ""
 echo " RaidMan has been installed."
@@ -226,7 +223,9 @@ if [ -x /etc/rc.d/rc.raidman ]; then
 else
   pkill -TERM -x raidman 2>/dev/null
 fi
-rm -f /etc/rc.d/rc.raidman /var/run/raidman.pid /var/log/raidman.log /var/log/raidman.log.1
+rm -f /etc/rc.d/rc.raidman /etc/logrotate.d/raidman
+rm -f /var/run/raidman.pid /var/run/raidman-supervisor.pid /var/run/raidman-supervisor.lock /var/run/raidman.stopped
+rm -f /var/log/raidman.log /var/log/raidman.log.1 /var/log/raidman-update.log
 
 # Clean up nginx configuration (include first, so nginx never references a
 # missing file)

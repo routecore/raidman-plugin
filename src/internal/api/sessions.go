@@ -9,8 +9,15 @@ import (
 
 const (
 	sessionCookieName = "raidman_session"
-	sessionTTL        = time.Hour
-	maxSessions       = 4096
+	// sessionIdleTTL is how long a session lives without use. Every
+	// successful resolve (noVNC asset, vm-vnc upgrade, and the periodic
+	// re-check of an open vm-vnc stream) slides it forward.
+	sessionIdleTTL = time.Hour
+	// sessionTTL is a session's absolute lifetime, however much it is used.
+	// It is also the raidman_session cookie's Max-Age (handlers.go), so the
+	// web view keeps the cookie for as long as the server may accept it.
+	sessionTTL  = 12 * time.Hour
+	maxSessions = 4096
 	// maxSessionsPerKey stops one key from churning sessions until it
 	// evicts everybody else's (every cookie-less /novnc/ request mints one).
 	maxSessionsPerKey = 16
@@ -18,7 +25,8 @@ const (
 
 type sessionEntry struct {
 	keyHash [32]byte
-	expires time.Time
+	expires time.Time // sliding idle expiry, never after created+sessionTTL
+	created time.Time
 }
 
 // sessionStore maps opaque random session ids (the raidman_session cookie) to
@@ -83,12 +91,12 @@ func (s *sessionStore) create(keyHash [32]byte) (string, error) {
 			delete(s.m, oldest)
 		}
 	}
-	s.m[id] = sessionEntry{keyHash: keyHash, expires: now.Add(sessionTTL)}
+	s.m[id] = sessionEntry{keyHash: keyHash, expires: slidExpiry(now, now), created: now}
 	return id, nil
 }
 
 // resolve returns the key hash bound to a session id, if it exists and has
-// not expired.
+// not expired, and extends its idle expiry (up to the absolute lifetime).
 func (s *sessionStore) resolve(id string) ([32]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -96,9 +104,22 @@ func (s *sessionStore) resolve(id string) ([32]byte, bool) {
 	if !ok {
 		return [32]byte{}, false
 	}
-	if s.now().After(e.expires) {
+	now := s.now()
+	if now.After(e.expires) {
 		delete(s.m, id)
 		return [32]byte{}, false
 	}
+	e.expires = slidExpiry(e.created, now)
+	s.m[id] = e
 	return e.keyHash, true
+}
+
+// slidExpiry is the idle expiry after a use at now, capped at the session's
+// absolute lifetime.
+func slidExpiry(created, now time.Time) time.Time {
+	exp := now.Add(sessionIdleTTL)
+	if limit := created.Add(sessionTTL); exp.After(limit) {
+		return limit
+	}
+	return exp
 }

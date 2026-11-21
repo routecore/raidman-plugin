@@ -81,7 +81,7 @@ var contractRoutes = map[string]Requirement{
 	"/api/plugins/check":  Perm(auth.ResourceConfig, auth.ActionUpdateAny),
 	"/api/plugins/update": Perm(auth.ResourceConfig, auth.ActionUpdateAny),
 	"/api/plugins/remove": AdminOnly(),
-	"/api/disks/smart":    Perm(auth.ResourceArray, auth.ActionReadAny),
+	"/api/disks/smart":    Perm(resourceDisk, auth.ActionReadAny),
 	"/api/files/list":     AdminOnly(),
 	"/api/files/download": AdminOnly(),
 	"/api/system/memory":  Perm(auth.ResourceInfo, auth.ActionReadAny),
@@ -90,12 +90,12 @@ var contractRoutes = map[string]Requirement{
 
 var contractStreams = map[string]Requirement{
 	"vm-vnc":       Perm(auth.ResourceVMs, auth.ActionUpdateAny),
-	"vm":           Perm(auth.ResourceVMs, auth.ActionUpdateAny),
+	"vm":           AdminOnly(), // serial console is a shell: ADMIN only
 	"vm-log":       Perm(auth.ResourceVMs, auth.ActionReadAny),
 	"array-status": Perm(auth.ResourceArray, auth.ActionReadAny),
 	"docker-stats": Perm(auth.ResourceDocker, auth.ActionReadAny),
 	"docker-log":   Perm(auth.ResourceDocker, auth.ActionReadAny),
-	"docker":       Perm(auth.ResourceDocker, auth.ActionUpdateAny),
+	"docker":       AdminOnly(), // docker exec is a shell: ADMIN only
 	"host":         AdminOnly(),
 }
 
@@ -190,7 +190,7 @@ func TestAuthorizationMatrix(t *testing.T) {
 		"perm": set("/api/vm/icon", "/novnc/", "/api/array/status", "/api/array/history",
 			"/api/docker/containers", "/api/docker/action", "/connect",
 			"/api/health", "/api/docker/updates", "/api/docker/updates/check", "/api/docker/meta",
-			"/api/disks/state", "/api/mover/status", "/api/disks/smart"),
+			"/api/disks/state", "/api/mover/status"),
 		"vmops": set("/api/vm/icon", "/novnc/", "/api/vm/autostart", "/api/vm/action", "/connect", "/api/health"),
 		"dockerro": set("/api/vm/icon", "/novnc/", "/connect", "/api/health",
 			"/api/docker/containers", "/api/docker/updates", "/api/docker/meta"),
@@ -296,8 +296,8 @@ func TestConnectPerTypeAuthorization(t *testing.T) {
 		"admin":    nil,
 		"viewer":   set("vm-log", "array-status", "docker-stats", "docker-log"),
 		"guest":    set(),
-		"perm":     set("array-status", "docker-stats", "docker-log", "docker"),
-		"vmops":    set("vm-vnc", "vm"),
+		"perm":     set("array-status", "docker-stats", "docker-log"),
+		"vmops":    set("vm-vnc"),
 		"dockerro": set("docker-stats", "docker-log"),
 	}
 	for name, secret := range keys {

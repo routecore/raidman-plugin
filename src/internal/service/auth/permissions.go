@@ -158,30 +158,3 @@ func roleGrants(role string, add func(resource, action string)) {
 		add(ResourceConnectRemoteAccess, ActionUpdateAny)
 	}
 }
-
-// parseScope mirrors upstream convertScopesToPermissions for a single legacy
-// string scope such as "docker:read", "docker:*" or "role:viewer".
-// It returns either a role, or a resource with its actions.
-func parseScope(scope string) (role string, resource string, actions []string, ok bool) {
-	if strings.HasPrefix(scope, "role:") {
-		r, ok := NormalizeRole(scope[len("role:"):])
-		return r, "", nil, ok
-	}
-	idx := strings.Index(scope, ":")
-	if idx <= 0 {
-		return "", "", nil, false
-	}
-	res, ok := NormalizeResource(scope[:idx])
-	if !ok {
-		return "", "", nil, false
-	}
-	act := strings.TrimSpace(scope[idx+1:])
-	if act == "*" {
-		return "", res, []string{ActionCreateAny, ActionReadAny, ActionUpdateAny, ActionDeleteAny}, true
-	}
-	a, ok := parseActionToAuthAction(act)
-	if !ok {
-		return "", "", nil, false
-	}
-	return "", res, []string{a}, true
-}

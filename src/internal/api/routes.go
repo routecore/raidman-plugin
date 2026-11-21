@@ -9,6 +9,9 @@ import (
 	"github.com/routecore/raidman-plugin/src/internal/service/auth"
 )
 
+// resourceDisk is the upstream DISK resource (graphql-enums.ts Resource.DISK).
+const resourceDisk = "DISK"
+
 type keyHandler func(w http.ResponseWriter, r *http.Request, k *auth.Key, src authSource)
 
 // route is one HTTP endpoint. Every route must declare a Requirement; the
@@ -95,7 +98,8 @@ func (a *Api) routes() []route {
 		{Path: "/api/plugins/check", Methods: post, Req: Perm(auth.ResourceConfig, auth.ActionUpdateAny), Handler: a.handlePluginsCheck, V2: true},
 		{Path: "/api/plugins/update", Methods: post, Req: Perm(auth.ResourceConfig, auth.ActionUpdateAny), Handler: a.handlePluginUpdate, V2: true},
 		{Path: "/api/plugins/remove", Methods: post, Req: AdminOnly(), Handler: a.handlePluginRemove, V2: true},
-		{Path: "/api/disks/smart", Methods: get, Req: Perm(auth.ResourceArray, auth.ActionReadAny), Handler: a.handleDiskSmart, V2: true},
+		// Upstream gates disk/SMART data on DISK:READ_ANY (disks.resolver.ts).
+		{Path: "/api/disks/smart", Methods: get, Req: Perm(resourceDisk, auth.ActionReadAny), Handler: a.handleDiskSmart, V2: true},
 		{Path: "/api/files/list", Methods: get, Req: AdminOnly(), Handler: a.handleFilesList, V2: true},
 		{Path: "/api/files/download", Methods: get, Req: AdminOnly(), Handler: a.handleFilesDownload, V2: true},
 		{Path: "/api/system/memory", Methods: get, Req: Perm(auth.ResourceInfo, auth.ActionReadAny), Handler: a.handleSystemMemory, V2: true},
@@ -116,11 +120,15 @@ func (a *Api) wsRoutes() map[string]wsRoute {
 		"array-status": {Req: Perm(auth.ResourceArray, auth.ActionReadAny), ReadLimit: readLimitDefault, Handle: (*Api).streamArrayStatus},
 		"docker-stats": {Req: Perm(auth.ResourceDocker, auth.ActionReadAny), ReadLimit: readLimitDefault, Handle: (*Api).streamDockerStats},
 		"docker-log":   {Req: Perm(auth.ResourceDocker, auth.ActionReadAny), ReadLimit: readLimitDefault, Handle: ptyStream("docker-log")},
-		"docker":       {Req: Perm(auth.ResourceDocker, auth.ActionUpdateAny), ReadLimit: readLimitDefault, Handle: ptyStream("docker")},
-		"vm-log":       {Req: Perm(auth.ResourceVMs, auth.ActionReadAny), ReadLimit: readLimitDefault, Handle: ptyStream("vm-log")},
-		"vm":           {Req: Perm(auth.ResourceVMs, auth.ActionUpdateAny), ReadLimit: readLimitDefault, Handle: ptyStream("vm")},
-		"vm-vnc":       {Req: Perm(auth.ResourceVMs, auth.ActionUpdateAny), ReadLimit: readLimitVNC, Handle: (*Api).streamVNC},
-		"host":         {Req: AdminOnly(), ReadLimit: readLimitDefault, Handle: ptyStream("host")},
+		// A shell in a container (default user usually root; privileged
+		// containers or a mounted docker.sock reach the host) and the VM
+		// serial console are ADMIN only: upstream DOCKER/VMS:UPDATE_ANY
+		// never include a shell.
+		"docker": {Req: AdminOnly(), ReadLimit: readLimitDefault, Handle: ptyStream("docker")},
+		"vm-log": {Req: Perm(auth.ResourceVMs, auth.ActionReadAny), ReadLimit: readLimitDefault, Handle: ptyStream("vm-log")},
+		"vm":     {Req: AdminOnly(), ReadLimit: readLimitDefault, Handle: ptyStream("vm")},
+		"vm-vnc": {Req: Perm(auth.ResourceVMs, auth.ActionUpdateAny), ReadLimit: readLimitVNC, Handle: (*Api).streamVNC},
+		"host":   {Req: AdminOnly(), ReadLimit: readLimitDefault, Handle: ptyStream("host")},
 	}
 }
 
@@ -210,11 +218,22 @@ func (a *Api) handleConnect(w http.ResponseWriter, r *http.Request, k *auth.Key,
 		log.Print("upgrade:", err)
 		return
 	}
-	ws := newWSConn(a.baseCtx, c, wr.ReadLimit)
+	ws := newWSConn(a.baseCtx, c, wr.ReadLimit, clientIP(r))
 	defer ws.Close()
 
 	hash := k.Hash()
+	// A cookie-session stream (noVNC) keeps its session alive while open,
+	// so noVNC's own reconnect after a network blip still authenticates.
+	var sessionID string
+	if src == authSession {
+		if c, err := r.Cookie(sessionCookieName); err == nil {
+			sessionID = c.Value
+		}
+	}
 	go ws.watchAuth(func() error {
+		if sessionID != "" {
+			_, _ = a.sessions.resolve(sessionID)
+		}
 		cur, err := a.keys.ByHash(hash)
 		if err != nil {
 			return err

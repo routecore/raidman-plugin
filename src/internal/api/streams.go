@@ -48,19 +48,7 @@ func (a *Api) streamArrayStatus(ws *wsConn, _ *http.Request, _ *auth.Key) {
 		}
 		prevStatus, lastUpdate, lastBroadcast = status, now, now
 
-		wrapper := map[string]any{
-			"array": map[string]any{
-				"state":             status.State,
-				"parityCheckStatus": status.ParityCheckStatus,
-				"parities":          status.Parities,
-				"disks":             status.Disks,
-				"caches":            status.Caches,
-				"boot":              status.Boot,
-				"bootDevices":       status.BootDevices,
-				"unassigned":        status.Unassigned,
-			},
-		}
-		return ws.WriteJSON(wrapper) == nil
+		return ws.WriteJSON(arrayStatusMessage(status)) == nil
 	}
 
 	if !broadcast() {
@@ -78,6 +66,28 @@ func (a *Api) streamArrayStatus(ws *wsConn, _ *http.Request, _ *auth.Key) {
 	}
 }
 
+// arrayStatusMessage is one array-status socket message: {"array": {...}}
+// plus an optional top-level "health" (var.ini health: resync action,
+// disabled/unmountable disks, mover, safe mode) that older plugins omit.
+func arrayStatusMessage(status *domain.ArrayStatus) map[string]any {
+	msg := map[string]any{
+		"array": map[string]any{
+			"state":             status.State,
+			"parityCheckStatus": status.ParityCheckStatus,
+			"parities":          status.Parities,
+			"disks":             status.Disks,
+			"caches":            status.Caches,
+			"boot":              status.Boot,
+			"bootDevices":       status.BootDevices,
+			"unassigned":        status.Unassigned,
+		},
+	}
+	if status.Health != nil {
+		msg["health"] = status.Health
+	}
+	return msg
+}
+
 func (a *Api) streamDockerStats(ws *wsConn, r *http.Request, _ *auth.Key) {
 	ws.drain()
 
@@ -91,11 +101,38 @@ func (a *Api) streamDockerStats(ws *wsConn, r *http.Request, _ *auth.Key) {
 		containerID = id
 	}
 
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	// All sockets share one sampler (one stats stream per container, not
+	// one per socket); this loop only reads its latest samples.
+	sub, err := docker.SubscribeStats()
+	if err != nil {
+		_ = ws.WriteText("Error: " + err.Error())
+		ws.closeWith(websocket.CloseInternalServerErr, "docker stats unavailable")
+		return
+	}
+	defer sub.Close()
+
+	const interval = 2 * time.Second
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	failures := 0
+	sent := false
+	fastUntil := time.Now().Add(3 * time.Second)
 	for {
-		stats, err := docker.GetContainerStats(ws.ctx, containerID)
+		select {
+		case <-ws.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		var (
+			payload any
+			ready   bool
+			err     error
+		)
+		if containerID != "" {
+			payload, ready, err = sub.One(ws.ctx, containerID)
+		} else {
+			payload, ready, err = sub.All()
+		}
 		switch {
 		case ws.ctx.Err() != nil:
 			return
@@ -104,7 +141,7 @@ func (a *Api) streamDockerStats(ws *wsConn, r *http.Request, _ *auth.Key) {
 			ws.closeWith(websocket.CloseNormalClosure, "container not found")
 			return
 		case errors.Is(err, context.DeadlineExceeded):
-			// Slow sample (busy daemon); not a failure, try again next tick.
+			// Slow docker daemon; not a failure, try again next tick.
 			log.Printf("docker-stats: %v", err)
 		case err != nil:
 			failures++
@@ -116,21 +153,19 @@ func (a *Api) streamDockerStats(ws *wsConn, r *http.Request, _ *auth.Key) {
 			}
 		default:
 			failures = 0
-			var payload any = stats
-			if containerID != "" {
-				if len(stats) == 0 {
-					break
+			if ready {
+				if ws.WriteJSON(payload) != nil {
+					return
 				}
-				payload = stats[0]
-			}
-			if ws.WriteJSON(payload) != nil {
-				return
+				sent = true
 			}
 		}
-		select {
-		case <-ws.ctx.Done():
-			return
-		case <-ticker.C:
+		// Poll quickly (for a few seconds at most) until the first samples
+		// are in, then every interval.
+		if !sent && err == nil && time.Now().Before(fastUntil) {
+			timer.Reset(250 * time.Millisecond)
+		} else {
+			timer.Reset(interval)
 		}
 	}
 }

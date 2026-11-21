@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,8 +12,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
@@ -42,7 +45,7 @@ func (a *Api) buildPtyCommand(termType string, r *http.Request) (*exec.Cmd, stri
 	case "host":
 		if !a.hostTerminalEnabled() {
 			log.Printf("[SECURITY] Host terminal disabled by settings")
-			return nil, "Error: Host terminal access is disabled by administrator"
+			return nil, errHostTerminalDisabled
 		}
 		cmd := exec.Command("/bin/bash", "--login")
 		cmd.Env = termEnv
@@ -117,32 +120,86 @@ func vmLogPath(name string) (string, bool) {
 	return p, true
 }
 
+// errHostTerminalDisabled is sent (and used as the close reason) when the
+// host terminal is turned off in the plugin settings.
+const errHostTerminalDisabled = "Error: Host terminal access is disabled by administrator"
+
+// hangupGrace is how long a hung-up session's process group gets to exit
+// before it is killed.
+const hangupGrace = 3 * time.Second
+
 func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Key) {
 	cmd, errMsg := a.buildPtyCommand(termType, r)
 	if cmd == nil {
 		_ = ws.WriteText(errMsg)
+		// Nothing else reads this socket; drain it so the peer's close
+		// echo ends the connection promptly.
+		ws.drain()
+		if errMsg == errHostTerminalDisabled {
+			ws.closeWith(websocket.ClosePolicyViolation, "host terminal disabled")
+		} else {
+			ws.closeWith(websocket.CloseNormalClosure, errMsg)
+		}
 		return
 	}
-	log.Printf("[AUDIT] Starting PTY session %q by key %s from %s", termType, k.Label(), r.RemoteAddr)
+	log.Printf("[AUDIT] Starting PTY session %q by key %s from %q", termType, k.Label(), truncate(clientIP(r), 64))
 
 	// pty.Start runs the child with Setsid, so it leads its own process
 	// group and the whole group can be signalled on close.
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		_ = ws.WriteText("Error starting pty: " + err.Error())
+		ws.drain()
+		ws.closeWith(websocket.CloseNormalClosure, "Error starting pty")
 		return
 	}
+	master := pollableMaster(ptmx)
+
+	// The watcher below may signal the process group only while the leader
+	// has not been reaped (a reaped pid/pgid can be recycled), so the
+	// deferred cleanup stops it and waits for it before terminateGroup
+	// reaps the leader.
+	stop := make(chan struct{})
+	var watcher sync.WaitGroup
 	defer func() {
-		_ = ptmx.Close()
+		close(stop)
+		watcher.Wait()
+		_ = master.Close()
 		terminateGroup(cmd)
 		log.Printf("[AUDIT] PTY session %q by key %s ended", termType, k.Label())
+		// The process ended on its own (exit, logs of a stopped
+		// container, ...): tell the client with a clean close instead of
+		// dropping the TCP connection.
+		if ws.ctx.Err() == nil {
+			code := -1
+			if cmd.ProcessState != nil {
+				code = cmd.ProcessState.ExitCode()
+			}
+			ws.closeWith(websocket.CloseNormalClosure, fmt.Sprintf("process exited (%d)", code))
+		}
 	}()
 
-	// Socket closed, key revoked or ping failure: close the PTY so the read
-	// loop below ends.
+	// Socket closed, key revoked or ping failure: close the master (which
+	// wakes the blocked Read below) and hang up the session's process
+	// group, killing it if it ignores SIGHUP. An idle shell or a quiet log
+	// stream writes nothing, so waiting for output would leak the process,
+	// the goroutines and the stream slot.
+	watcher.Add(1)
 	go func() {
-		<-ws.ctx.Done()
-		_ = ptmx.Close()
+		defer watcher.Done()
+		select {
+		case <-stop:
+			return
+		case <-ws.ctx.Done():
+		}
+		_ = master.Close()
+		pid := cmd.Process.Pid
+		_ = syscall.Kill(-pid, syscall.SIGHUP)
+		select {
+		case <-stop:
+		case <-time.After(hangupGrace):
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
 	}()
 
 	// Log streams are read-only (they only need DOCKER/VMS:READ_ANY):
@@ -152,37 +209,92 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 		for {
 			mt, message, err := ws.ReadMessage()
 			if err != nil {
-				_ = ptmx.Close()
-				return
+				return // ReadMessage cancelled ws.ctx; the watcher cleans up
 			}
 			if mt == websocket.TextMessage {
 				if cols, rows, ok := parseResize(message); ok {
 					// A failed resize must not end the session.
-					_ = pty.Setsize(ptmx, &pty.Winsize{Cols: cols, Rows: rows})
+					_ = pty.Setsize(master, &pty.Winsize{Cols: cols, Rows: rows})
 					continue
 				}
 			}
 			if readOnly {
 				continue
 			}
-			if _, err := ptmx.Write(message); err != nil {
+			if _, err := master.Write(message); err != nil {
 				return
 			}
 		}
 	}()
 
+	// Output frames never end inside a UTF-8 sequence: an incomplete tail
+	// (at most utf8.UTFMax-1 bytes) is kept at the front of buf and sent
+	// with the next read, so clients decoding frame by frame do not turn
+	// split characters into U+FFFD.
 	buf := make([]byte, 32*1024)
+	pending := 0
 	for {
-		n, err := ptmx.Read(buf)
-		if n > 0 {
-			if werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
+		n, err := master.Read(buf[pending:])
+		n += pending
+		send := utf8SafeLen(buf[:n])
+		if err != nil {
+			send = n // flush everything at EOF/error
+		}
+		if send > 0 {
+			if werr := ws.WriteMessage(websocket.BinaryMessage, buf[:send]); werr != nil {
 				return
 			}
 		}
+		pending = copy(buf, buf[send:n])
 		if err != nil {
 			return
 		}
 	}
+}
+
+// utf8SafeLen returns how many leading bytes of p can be sent without
+// splitting a UTF-8 sequence: it holds back an incomplete multi-byte
+// sequence at the very end. Invalid bytes are never held back (FullRune
+// reports true for them), so non-UTF-8 output always flows.
+func utf8SafeLen(p []byte) int {
+	for i := len(p) - 1; i >= 0 && i >= len(p)-(utf8.UTFMax-1); i-- {
+		if utf8.RuneStart(p[i]) {
+			if utf8.FullRune(p[i:]) {
+				return len(p)
+			}
+			return i
+		}
+	}
+	return len(p)
+}
+
+// pollableMaster moves the PTY master onto the runtime poller.
+//
+// creack/pty calls Fd() on the master, which switches it to blocking mode;
+// a Read blocked on such a file is not woken by Close, so a session whose
+// child is idle would never notice the client leaving. A duplicate set to
+// non-blocking and wrapped with os.NewFile is registered with the poller
+// (and Fd() on it, e.g. from pty.Setsize, keeps it non-blocking), so Close
+// interrupts the pending Read. If that fails the original is returned and
+// the process-group hang-up still ends the session.
+func pollableMaster(ptmx *os.File) *os.File {
+	// ForkLock keeps a concurrent exec from inheriting the fd before it
+	// is marked close-on-exec.
+	syscall.ForkLock.RLock()
+	nfd, err := syscall.Dup(int(ptmx.Fd()))
+	if err == nil {
+		syscall.CloseOnExec(nfd)
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		return ptmx
+	}
+	if err := syscall.SetNonblock(nfd, true); err != nil {
+		_ = syscall.Close(nfd)
+		return ptmx
+	}
+	_ = ptmx.Close()
+	return os.NewFile(uintptr(nfd), ptmx.Name())
 }
 
 // Terminal size bounds for resize requests.

@@ -18,9 +18,10 @@ const (
 	// Permission-only key (unraid-api #2152: roles may be empty).
 	fixturePermOnly = `{"id":"p-1","key":"permsecret","name":"docker-ops","roles":[],"permissions":[{"resource":"DOCKER","actions":["READ_ANY","UPDATE_ANY"]},{"resource":"ARRAY","actions":["READ_ANY"]}],"createdAt":"2026-01-02T03:04:05.000Z"}`
 	// Legacy file: lower-case role, legacy verbs, mixed-case resource.
-	fixtureLegacyActions = `{"id":"l-1","key":"legacysecret","name":"legacy","roles":["viewer"],"permissions":[{"resource":"vms","actions":["update","read:any","DELETE"]},{"resource":"Docker","actions":["update:own"]}]}`
-	// Legacy string scopes (pre-object permission format).
-	fixtureLegacyScopes = `{"id":"s-1","key":"scopesecret","name":"scopes","permissions":["docker:*","vms:read","role:guest","bogus:read","array:frobnicate"]}`
+	fixtureLegacyActions = `{"id":"l-1","key":"legacysecret","name":"legacy","roles":["viewer"],"permissions":[{"resource":"vms","actions":["update","read:any","DELETE"]},{"resource":"Docker","actions":["update:own"]}],"createdAt":"2024-01-02T03:04:05.000Z"}`
+	// Legacy string scopes (pre-object permission format): rejected by the
+	// Unraid API (permissions must be objects), so rejected here too.
+	fixtureLegacyScopes = `{"id":"s-1","key":"scopesecret","name":"scopes","roles":[],"permissions":["docker:*","vms:read","role:guest"],"createdAt":"2024-01-02T03:04:05.000Z"}`
 )
 
 func mustParse(t *testing.T, js string) *Key {
@@ -137,48 +138,28 @@ func TestParseLegacyActions(t *testing.T) {
 	})
 }
 
-func TestParseLegacyScopes(t *testing.T) {
-	k, warnings, err := ParseKey([]byte(fixtureLegacyScopes))
-	if err != nil {
-		t.Fatal(err)
+func TestParseLegacyScopesRejected(t *testing.T) {
+	if k, _, err := ParseKey([]byte(fixtureLegacyScopes)); err == nil {
+		t.Fatalf("legacy string scopes must reject the key, got grants %v", k.GrantList())
 	}
-	if len(warnings) != 2 {
-		t.Fatalf("want 2 warnings (unknown resource, unknown action), got %v", warnings)
-	}
-	runChecks(t, "scopes", k, []check{
-		{ResourceDocker, ActionCreateAny, true},
-		{ResourceDocker, ActionReadAny, true},
-		{ResourceDocker, ActionUpdateAny, true},
-		{ResourceDocker, ActionDeleteAny, true},
-		{ResourceVMs, ActionReadAny, true},
-		{ResourceVMs, ActionUpdateAny, false},
-		{ResourceMe, ActionReadAny, true}, // role:guest
-		{ResourceArray, ActionUpdateAny, false},
-	})
 }
 
 func TestParseWildcardAndUnknownGrantNothing(t *testing.T) {
-	js := `{"id":"w","key":"wild","roles":["SUPERUSER","admin "],"permissions":[{"resource":"*","actions":["*"]},{"resource":"DOCKER","actions":["*","write"]},{"resource":"NOPE","actions":["READ_ANY"]},42]}`
+	// An unknown but enum-shaped resource (added by a newer Unraid API) is
+	// skipped; unknown actions next to a known one are dropped.
+	js := `{"id":"w","key":"wild","name":"w","roles":[],"permissions":[{"resource":"NOPE","actions":["READ_ANY"]},{"resource":"DOCKER","actions":["*","write","read"]}],"createdAt":"2026-01-02T03:04:05.000Z"}`
 	k, warnings, err := ParseKey([]byte(js))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(warnings) == 0 {
-		t.Fatal("expected warnings for unknown role/resource/action")
+		t.Fatal("expected warnings for unknown resource/actions")
 	}
-	// "admin " normalises to ADMIN (upstream upper-cases roles); the unknown
-	// role is ignored.
-	if !k.IsAdmin() {
-		t.Fatal("trimmed lower-case admin role should be ADMIN")
+	if k.IsAdmin() || k.Has(ResourceDocker, ActionUpdateAny) || !k.Has(ResourceDocker, ActionReadAny) {
+		t.Fatalf("grants = %v", k.GrantList())
 	}
-
-	js2 := `{"id":"w2","key":"wild2","roles":["NOPE"],"permissions":[{"resource":"DOCKER","actions":["*"]}]}`
-	k2, _, err := ParseKey([]byte(js2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if k2.IsAdmin() || k2.Has(ResourceDocker, ActionReadAny) || len(k2.GrantList()) != 0 {
-		t.Fatalf("wildcard object action must grant nothing, got %v", k2.GrantList())
+	if got := k.GrantList(); len(got) != 1 {
+		t.Fatalf("grants = %v, want only DOCKER:READ_ANY", got)
 	}
 }
 

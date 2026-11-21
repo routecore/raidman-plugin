@@ -153,11 +153,11 @@ func (a *Api) authorize(w http.ResponseWriter, r *http.Request, req Requirement,
 	if err != nil {
 		if errors.Is(err, auth.ErrKeyNotAllowed) {
 			if securityLog.allow("allowlist:" + k.Label()) {
-				log.Printf("[SECURITY] Key %s rejected by RaidMan allowlist (%s %s)", k.Label(), r.Method, r.URL.Path)
+				log.Printf("[SECURITY] Key %s rejected by RaidMan allowlist (%s %s)", k.Label(), r.Method, logPath(r))
 			}
 		} else if !errors.Is(err, errNoCredentials) {
 			if securityLog.allow("invalid:" + clientIP(r)) {
-				log.Printf("[SECURITY] Invalid API key from %s (%s %s)", clientIP(r), r.Method, r.URL.Path)
+				log.Printf("[SECURITY] Invalid API key from %q (%s %s)", truncate(clientIP(r), 64), r.Method, logPath(r))
 			}
 		}
 		errf(w, http.StatusUnauthorized, "Unauthorized")
@@ -165,7 +165,7 @@ func (a *Api) authorize(w http.ResponseWriter, r *http.Request, req Requirement,
 	}
 	if !req.Allows(k) {
 		if securityLog.allow("denied:" + k.ID + ":" + r.URL.Path) {
-			log.Printf("[SECURITY] Key %s denied %s %s (requires %s)", k.Label(), r.Method, r.URL.Path, req)
+			log.Printf("[SECURITY] Key %s denied %s %s (requires %s)", k.Label(), r.Method, logPath(r), req)
 		}
 		errf(w, http.StatusForbidden, fmt.Sprintf("Permission denied: requires %s", req))
 		return nil, authNone
@@ -225,6 +225,16 @@ func (l *logLimiter) allow(key string) bool {
 	}
 	l.last[key] = now
 	return true
+}
+
+// logPathMax bounds how much of a request path is written to the log.
+const logPathMax = 200
+
+// logPath is the request path for a log line: quoted (so a decoded %0A in an
+// attacker-chosen path under a prefix route cannot start a forged line) and
+// truncated (so one request cannot write kilobytes).
+func logPath(r *http.Request) string {
+	return fmt.Sprintf("%q", truncate(r.URL.Path, logPathMax))
 }
 
 // truncate shortens s to at most n bytes (for logs and map keys).

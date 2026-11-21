@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/routecore/raidman-plugin/src/internal/domain"
@@ -15,21 +16,100 @@ import (
 	"libvirt.org/go/libvirtxml"
 )
 
-// Helper to connect to libvirt
-func connect() (*libvirt.Libvirt, error) {
+// libvirt RPC budgets. go-libvirt puts no deadline on RPCs, so a wedged
+// libvirtd would pin the calling goroutine (and its stream slot) forever.
+// Each operation dials its own connection; the watchdog closes it when one
+// RPC goes unanswered for longer than the budget, which fails every pending
+// call, and the next operation simply dials again. A socket read deadline
+// cannot be used: go-libvirt treats a timeout as a temporary error and keeps
+// re-reading in a busy loop. Overridable in tests.
+var (
+	// queryTimeout bounds each read-only RPC (lookups, info, XML, agent
+	// address queries, which libvirt itself times out after a few seconds).
+	queryTimeout = 30 * time.Second
+	// actionTimeout bounds each RPC of a state change: destroying or
+	// starting a VM with passthrough devices can legitimately take well over
+	// 30 seconds.
+	actionTimeout = 3 * time.Minute
+)
 
-	c, err := net.DialTimeout("unix", "/var/run/libvirt/libvirt-sock", 2*time.Second)
+// ErrTimeout is returned (wrapped) when libvirtd did not answer an RPC
+// within its budget.
+var ErrTimeout = errors.New("libvirt did not respond in time")
+
+// libvirtSocket is the libvirtd socket; dialLibvirt is overridable in tests.
+const libvirtSocket = "/var/run/libvirt/libvirt-sock"
+
+var dialLibvirt = func() (net.Conn, error) {
+	return net.DialTimeout("unix", libvirtSocket, 2*time.Second)
+}
+
+// watchdogConn closes the connection when no request was written for
+// timeout. Every RPC writes a request, so the timer re-arms per call; it is
+// stopped when the connection is closed.
+type watchdogConn struct {
+	net.Conn
+	timeout time.Duration
+	timer   *time.Timer
+	fired   atomic.Bool
+}
+
+func newWatchdogConn(c net.Conn, timeout time.Duration) *watchdogConn {
+	w := &watchdogConn{Conn: c, timeout: timeout}
+	w.timer = time.AfterFunc(timeout, func() {
+		w.fired.Store(true)
+		c.Close()
+	})
+	return w
+}
+
+func (w *watchdogConn) Write(b []byte) (int, error) {
+	w.timer.Reset(w.timeout)
+	return w.Conn.Write(b)
+}
+
+func (w *watchdogConn) Close() error {
+	w.timer.Stop()
+	return w.Conn.Close()
+}
+
+// conn is a libvirt connection guarded by a watchdog.
+type conn struct {
+	*libvirt.Libvirt
+	wd *watchdogConn
+}
+
+// connect dials libvirtd; timeout bounds each RPC, including the handshake
+// and the final Disconnect.
+func connect(timeout time.Duration) (*conn, error) {
+	c, err := dialLibvirt()
 	if err != nil {
 		return nil, err
 	}
-
-	l := libvirt.New(c)
+	wd := newWatchdogConn(c, timeout)
+	l := libvirt.New(wd)
 	if err := l.Connect(); err != nil {
-		c.Close()
-		return nil, err
+		wd.Close()
+		return nil, wrapTimeout(wd, err)
 	}
+	return &conn{Libvirt: l, wd: wd}, nil
+}
 
-	return l, nil
+func wrapTimeout(wd *watchdogConn, err error) error {
+	if err != nil && wd.fired.Load() && !errors.Is(err, ErrTimeout) {
+		return fmt.Errorf("%w: %v", ErrTimeout, err)
+	}
+	return err
+}
+
+// close disconnects (still under the watchdog: Disconnect sends an RPC) and,
+// when the watchdog fired, marks *errp as a timeout.
+func (c *conn) close(errp *error) {
+	_ = c.Disconnect()
+	c.wd.Close()
+	if errp != nil {
+		*errp = wrapTimeout(c.wd, *errp)
+	}
 }
 
 // ParseUUID parses a libvirt domain UUID in canonical (8-4-4-4-12) or plain
@@ -79,13 +159,13 @@ type Domain struct {
 }
 
 // ResolveDomain resolves a VM reference to its exact libvirt name and UUID.
-func ResolveDomain(ref string) (*Domain, error) {
-	l, err := connect()
+func ResolveDomain(ref string) (_ *Domain, err error) {
+	l, err := connect(queryTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to libvirt: %v", err)
+		return nil, fmt.Errorf("failed to connect to libvirt: %w", err)
 	}
-	defer l.Disconnect()
-	dom, err := lookupDomain(l, ref)
+	defer l.close(&err)
+	dom, err := lookupDomain(l.Libvirt, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -291,16 +371,12 @@ func enrichVmInfo(l *libvirt.Libvirt, dom libvirt.Domain) (domain.VmInfo, error)
 	return info, nil
 }
 
-func GetVms() ([]domain.VmInfo, error) {
-	l, err := connect()
+func GetVms() (_ []domain.VmInfo, err error) {
+	l, err := connect(queryTimeout)
 	if err != nil {
-		return []domain.VmInfo{}, fmt.Errorf("failed to connect to libvirt: %v", err)
+		return []domain.VmInfo{}, fmt.Errorf("failed to connect to libvirt: %w", err)
 	}
-	defer func() {
-		if err := l.Disconnect(); err != nil {
-			// ignore
-		}
-	}()
+	defer l.close(&err)
 
 	// List Defined (Inactive) and Active Domains
 	doms, err := l.Domains()
@@ -311,44 +387,47 @@ func GetVms() ([]domain.VmInfo, error) {
 	vms := make([]domain.VmInfo, 0)
 
 	for _, dom := range doms {
-		info, err := enrichVmInfo(l, dom)
+		info, err := enrichVmInfo(l.Libvirt, dom)
 		if err != nil {
 			continue
 		}
 		vms = append(vms, info)
 	}
+	if l.wd.fired.Load() {
+		// The connection was cut mid-way: do not report a partial list.
+		return []domain.VmInfo{}, ErrTimeout
+	}
 
 	return vms, nil
 }
 
-func GetVmInfo(vmName string) (*domain.VmInfo, error) {
-	l, err := connect()
+func GetVmInfo(vmName string) (_ *domain.VmInfo, err error) {
+	l, err := connect(queryTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to libvirt: %v", err)
+		return nil, fmt.Errorf("failed to connect to libvirt: %w", err)
 	}
-	defer func() {
-		if err := l.Disconnect(); err != nil {
-			// ignore
-		}
-	}()
+	defer l.close(&err)
 
-	dom, err := lookupDomain(l, vmName)
+	dom, err := lookupDomain(l.Libvirt, vmName)
 	if err != nil {
 		return nil, err
 	}
 
-	info, err := enrichVmInfo(l, dom)
+	info, err := enrichVmInfo(l.Libvirt, dom)
+	if err == nil && l.wd.fired.Load() {
+		return nil, ErrTimeout
+	}
 	return &info, err
 }
 
-func SetVmAutostart(vmName string, enabled bool) error {
-	l, err := connect()
+func SetVmAutostart(vmName string, enabled bool) (err error) {
+	l, err := connect(queryTimeout)
 	if err != nil {
 		return err
 	}
-	defer l.Disconnect()
+	defer l.close(&err)
 
-	dom, err := lookupDomain(l, vmName)
+	dom, err := lookupDomain(l.Libvirt, vmName)
 	if err != nil {
 		return err
 	}
@@ -368,17 +447,17 @@ var vmActions = map[string]bool{
 // ValidAction reports whether ExecuteVmAction knows the action.
 func ValidAction(action string) bool { return vmActions[action] }
 
-func ExecuteVmAction(vmName string, action string) error {
+func ExecuteVmAction(vmName string, action string) (err error) {
 	if !ValidAction(action) {
 		return fmt.Errorf("invalid action: %s", action)
 	}
-	l, err := connect()
+	l, err := connect(actionTimeout)
 	if err != nil {
 		return err
 	}
-	defer l.Disconnect()
+	defer l.close(&err)
 
-	dom, err := lookupDomain(l, vmName)
+	dom, err := lookupDomain(l.Libvirt, vmName)
 	if err != nil {
 		return err
 	}
@@ -484,14 +563,14 @@ func destroyAndCreate(c resetConn, dom libvirt.Domain, why error) error {
 	return nil
 }
 
-func GetVncPort(vmName string) (string, error) {
-	l, err := connect()
+func GetVncPort(vmName string) (_ string, err error) {
+	l, err := connect(queryTimeout)
 	if err != nil {
 		return "", err
 	}
-	defer l.Disconnect()
+	defer l.close(&err)
 
-	dom, err := lookupDomain(l, vmName)
+	dom, err := lookupDomain(l.Libvirt, vmName)
 	if err != nil {
 		return "", err
 	}

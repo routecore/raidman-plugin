@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -89,25 +90,44 @@ func (k *Key) GrantList() []string {
 }
 
 type rawKey struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
+	ID          *string           `json:"id"`
+	Name        *string           `json:"name"`
 	Key         string            `json:"key"`
+	CreatedAt   *string           `json:"createdAt"`
 	Roles       []json.RawMessage `json:"roles"`
 	Permissions []json.RawMessage `json:"permissions"`
 }
 
+// RequireCreatedAt makes a key file without a non-empty createdAt string
+// invalid, like upstream. Overridable in tests whose fixtures predate it.
+var RequireCreatedAt = true
+
 // ErrNoSecret is returned when a key file has no "key" field.
 var ErrNoSecret = errors.New("key file has no secret")
 
-// ParseKey decodes an upstream API key file. It accepts:
-//   - the current upstream shape: roles: ["ADMIN"], permissions: [{resource, actions[]}]
-//   - lower/mixed-case roles, resources and actions
-//   - legacy actions ("read", "read:any", "READ") normalised like upstream's
-//     normalizeLegacyActions
-//   - legacy string scopes in permissions ("docker:read", "docker:*", "role:viewer")
+// enumShaped matches names shaped like an upstream Resource enum value. An
+// unknown resource of this shape is most likely one a newer Unraid API added,
+// so it is skipped instead of invalidating the key.
+var enumShaped = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+
+// ParseKey decodes an upstream API key file and accepts only files the
+// Unraid API itself accepts (loadApiKeyFile: roles upper-cased, actions run
+// through normalizeLegacyActions, then class-validator on the ApiKey model),
+// so a key Unraid ignores - and therefore does not show in its API Keys page -
+// never works against RaidMan. The whole key is rejected (error) when:
+//   - id, name or createdAt is missing or empty, or id is not a plain file
+//     name
+//   - roles or permissions is missing or not an array
+//   - a role is not a string or, upper-cased, not an upstream Role
+//   - a permission is not a {resource, actions[]} object (legacy string
+//     scopes included), or none of its actions is a known AuthAction
 //
-// Unknown roles, resources or actions are skipped (they grant nothing) and
-// reported in warnings. A structurally invalid file returns an error.
+// Normalisation kept from upstream: role case, legacy actions ("read",
+// "read:any", "READ"). Resource case is also folded. A resource that is not
+// in the mirrored enum but is shaped like one (a resource added by a newer
+// Unraid API) is skipped with a warning and grants nothing; any other
+// unknown resource rejects the key. Unknown actions next to known ones are
+// dropped, like upstream.
 func ParseKey(data []byte) (*Key, []string, error) {
 	var raw rawKey
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -116,10 +136,28 @@ func ParseKey(data []byte) (*Key, []string, error) {
 	if raw.Key == "" {
 		return nil, nil, ErrNoSecret
 	}
+	if raw.ID == nil || *raw.ID == "" {
+		return nil, nil, errors.New("key file has no id")
+	}
+	if id := *raw.ID; id == "." || id == ".." || strings.ContainsAny(id, "/\\:\x00") {
+		return nil, nil, fmt.Errorf("invalid key id %q", id)
+	}
+	if raw.Name == nil || *raw.Name == "" {
+		return nil, nil, errors.New("key file has no name")
+	}
+	if RequireCreatedAt && (raw.CreatedAt == nil || *raw.CreatedAt == "") {
+		return nil, nil, errors.New("key file has no createdAt")
+	}
+	if raw.Roles == nil {
+		return nil, nil, errors.New("key file has no roles array")
+	}
+	if raw.Permissions == nil {
+		return nil, nil, errors.New("key file has no permissions array")
+	}
 
 	k := &Key{
-		ID:     raw.ID,
-		Name:   raw.Name,
+		ID:     *raw.ID,
+		Name:   *raw.Name,
 		hash:   HashSecret(raw.Key),
 		grants: map[string]map[string]bool{},
 	}
@@ -132,14 +170,6 @@ func ParseKey(data []byte) (*Key, []string, error) {
 			k.grants[resource] = m
 		}
 		m[action] = true
-	}
-	addRole := func(role string) {
-		for _, r := range k.Roles {
-			if r == role {
-				return
-			}
-		}
-		k.Roles = append(k.Roles, role)
 	}
 	addPerm := func(resource string, actions []string) {
 		for i := range k.Permissions {
@@ -158,52 +188,34 @@ func ParseKey(data []byte) (*Key, []string, error) {
 	for _, rr := range raw.Roles {
 		var s string
 		if err := json.Unmarshal(rr, &s); err != nil {
-			warnings = append(warnings, fmt.Sprintf("ignoring non-string role %s", string(rr)))
-			continue
+			return nil, nil, fmt.Errorf("non-string role %s", string(rr))
 		}
-		role, ok := NormalizeRole(s)
-		if !ok {
-			warnings = append(warnings, fmt.Sprintf("ignoring unknown role %q", s))
-			continue
+		// Upstream upper-cases roles (no trimming) before the enum check.
+		role := strings.ToUpper(s)
+		if !roleSet[role] {
+			return nil, nil, fmt.Errorf("unknown role %q", s)
 		}
-		addRole(role)
+		if !contains(k.Roles, role) {
+			k.Roles = append(k.Roles, role)
+		}
 	}
 
 	for _, rp := range raw.Permissions {
-		// Legacy string scope.
-		var scope string
-		if err := json.Unmarshal(rp, &scope); err == nil {
-			role, res, acts, ok := parseScope(scope)
-			if !ok {
-				warnings = append(warnings, fmt.Sprintf("ignoring unknown permission scope %q", scope))
-				continue
-			}
-			if role != "" {
-				addRole(role)
-			} else {
-				addPerm(res, acts)
-			}
-			continue
-		}
-		// Upstream object form.
 		var obj struct {
-			Resource string   `json:"resource"`
+			Resource *string  `json:"resource"`
 			Actions  []string `json:"actions"`
 		}
-		if err := json.Unmarshal(rp, &obj); err != nil {
-			warnings = append(warnings, fmt.Sprintf("ignoring malformed permission %s", string(rp)))
-			continue
+		if len(rp) == 0 || rp[0] != '{' {
+			return nil, nil, fmt.Errorf("permission is not an object: %s", string(rp))
 		}
-		res, ok := NormalizeResource(obj.Resource)
-		if !ok {
-			warnings = append(warnings, fmt.Sprintf("ignoring permission for unknown resource %q", obj.Resource))
-			continue
+		if err := json.Unmarshal(rp, &obj); err != nil || obj.Resource == nil {
+			return nil, nil, fmt.Errorf("malformed permission %s", string(rp))
 		}
 		var acts []string
 		for _, a := range obj.Actions {
 			na, ok := NormalizeLegacyAction(a)
 			if !ok {
-				warnings = append(warnings, fmt.Sprintf("ignoring unknown action %q on %s", a, res))
+				warnings = append(warnings, fmt.Sprintf("ignoring unknown action %q on %s", a, *obj.Resource))
 				continue
 			}
 			if !contains(acts, na) {
@@ -211,6 +223,15 @@ func ParseKey(data []byte) (*Key, []string, error) {
 			}
 		}
 		if len(acts) == 0 {
+			// Upstream: ArrayMinSize(1) after normalizeLegacyActions.
+			return nil, nil, fmt.Errorf("permission on %q has no valid actions", *obj.Resource)
+		}
+		res, ok := NormalizeResource(*obj.Resource)
+		if !ok {
+			if !enumShaped.MatchString(res) {
+				return nil, nil, fmt.Errorf("invalid resource %q", *obj.Resource)
+			}
+			warnings = append(warnings, fmt.Sprintf("ignoring permission for unknown resource %q", *obj.Resource))
 			continue
 		}
 		addPerm(res, acts)

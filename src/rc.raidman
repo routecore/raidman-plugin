@@ -2,16 +2,31 @@
 #
 # /etc/rc.d/rc.raidman - start/stop/restart the RaidMan daemon.
 #
+# "start" launches a small supervisor (this script with the internal argument
+# "supervise") that runs the daemon and restarts it with a backoff when it
+# crashes (non-zero exit). A clean exit (SIGTERM to the daemon) or "stop" also
+# ends the supervisor, and a lock makes sure only one supervisor runs.
 # The daemon writes its own PID file, so "stop" always signals the real
-# process (not a wrapper shell), and "start" waits until the previous
-# instance has released the port.
+# process, and "start" only reports success once that process is listening.
 
-BIN=/usr/local/emhttp/plugins/raidman/raidman
-PIDFILE=/var/run/raidman.pid
-LOG=/var/log/raidman.log
+BIN=${RAIDMAN_BIN:-/usr/local/emhttp/plugins/raidman/raidman}
+RUN_DIR=${RAIDMAN_RUN_DIR:-/var/run}
+LOG=${RAIDMAN_LOG:-/var/log/raidman.log}
+PORT=${RAIDMAN_PORT:-9876}
 HOST=127.0.0.1
-PORT=9876
+PIDFILE=$RUN_DIR/raidman.pid
+SUPPIDFILE=$RUN_DIR/raidman-supervisor.pid
+LOCKFILE=$RUN_DIR/raidman-supervisor.lock
+# Present while the service is meant to be down; the supervisor never
+# restarts the daemon while it exists.
+STOPFILE=$RUN_DIR/raidman.stopped
 MAX_LOG_BYTES=$((5 * 1024 * 1024))
+# Restart backoff in seconds: doubles after each crash up to BACKOFF_MAX and
+# goes back to BACKOFF_MIN once the daemon has run for HEALTHY_SECS.
+BACKOFF_MIN=${RAIDMAN_BACKOFF_MIN:-2}
+BACKOFF_MAX=60
+HEALTHY_SECS=60
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 
 running_pid() {
   local pid
@@ -23,8 +38,32 @@ running_pid() {
   return 1
 }
 
+supervisor_pid() {
+  local pid
+  pid=$(cat "$SUPPIDFILE" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null &&
+    [ "$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | tail -n 1)" = "supervise" ]; then
+    echo "$pid"
+    return 0
+  fi
+  return 1
+}
+
 port_in_use() {
   (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null
+}
+
+# pid_listening PID: true when PID itself owns the listening socket on
+# HOST:PORT (not merely "something answers on the port").
+pid_listening() {
+  local pid=$1 addr inode fd
+  addr=$(printf '0100007F:%04X' "$PORT")
+  inode=$(awk -v a="$addr" '$2 == a && $4 == "0A" { print $10; exit }' /proc/net/tcp 2>/dev/null)
+  [ -n "$inode" ] || return 1
+  for fd in /proc/"$pid"/fd/*; do
+    [ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ] && return 0
+  done
+  return 1
 }
 
 wait_port_free() {
@@ -44,10 +83,73 @@ rotate_log() {
   fi
 }
 
+say() {
+  echo "$(date '+%Y/%m/%d %H:%M:%S') [SUPERVISOR] $*"
+}
+
+# Runs detached (see start); stdout/stderr already go to $LOG.
+supervise() {
+  local child=0 rc started backoff=$BACKOFF_MIN stopping=0
+  cd / || exit 1
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCKFILE"
+    flock -n 9 || exit 0 # another supervisor already runs the daemon
+  fi
+  echo $$ >"$SUPPIDFILE"
+  # Host terminals start in $HOME; never inherit the caller's directory.
+  export HOME=/root
+  trap 'stopping=1; [ "$child" -gt 0 ] && kill -TERM "$child" 2>/dev/null' TERM INT HUP
+
+  while [ "$stopping" = 0 ] && [ ! -e "$STOPFILE" ]; do
+    if [ ! -x "$BIN" ]; then
+      say "binary $BIN not found; supervisor exiting"
+      break
+    fi
+    started=$SECONDS
+    "$BIN" -host "$HOST" -port "$PORT" -pidfile "$PIDFILE" </dev/null 9>&- &
+    child=$!
+    wait "$child"
+    rc=$?
+    # A trapped signal interrupts wait; keep waiting for the daemon to exit.
+    while kill -0 "$child" 2>/dev/null; do
+      wait "$child"
+      rc=$?
+    done
+    child=0
+    if [ "$stopping" = 1 ] || [ -e "$STOPFILE" ]; then
+      break
+    fi
+    if [ "$rc" -eq 0 ]; then
+      say "RaidMan exited cleanly; not restarting"
+      break
+    fi
+    if [ $((SECONDS - started)) -ge "$HEALTHY_SECS" ]; then
+      backoff=$BACKOFF_MIN
+    fi
+    say "RaidMan exited with status $rc; restarting in ${backoff}s"
+    sleep "$backoff" 9>&- &
+    child=$!
+    wait "$child"
+    child=0
+    backoff=$((backoff * 2))
+    [ "$backoff" -le "$BACKOFF_MAX" ] || backoff=$BACKOFF_MAX
+  done
+  if [ "$(cat "$SUPPIDFILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$SUPPIDFILE"
+  fi
+  exit 0
+}
+
 start() {
   local pid i
+  # Never keep the caller's directory (e.g. a share under /mnt) busy.
+  cd / || return 1
   if pid=$(running_pid); then
     echo "RaidMan is already running (pid $pid)"
+    return 0
+  fi
+  if pid=$(supervisor_pid); then
+    echo "RaidMan supervisor is already running (pid $pid); the daemon is being restarted"
     return 0
   fi
   if [ ! -x "$BIN" ]; then
@@ -55,22 +157,24 @@ start() {
     return 1
   fi
   if ! wait_port_free; then
-    echo "Port $PORT is still in use; the daemon will keep retrying for 30s"
+    echo "Port $PORT is in use by another process; the daemon will keep retrying"
   fi
+  mkdir -p "$RUN_DIR"
+  rm -f "$STOPFILE"
   rotate_log
   # setsid detaches from the installer's session; all fds are redirected so
   # the plugin installer never waits on the daemon.
-  setsid "$BIN" -host "$HOST" -port "$PORT" -pidfile "$PIDFILE" </dev/null >>"$LOG" 2>&1 &
+  setsid "$SELF" supervise </dev/null >>"$LOG" 2>&1 &
   for i in $(seq 1 40); do
-    if pid=$(running_pid) && port_in_use; then
+    if pid=$(running_pid) && pid_listening "$pid"; then
       echo "RaidMan started (pid $pid, listening on $HOST:$PORT)"
       return 0
     fi
     sleep 0.25
   done
   if pid=$(running_pid); then
-    echo "RaidMan started (pid $pid) but is not listening yet; see $LOG"
-    return 0
+    echo "WARNING: RaidMan is running (pid $pid) but is not listening on $HOST:$PORT yet; see $LOG"
+    return 1
   fi
   echo "RaidMan failed to start; last log lines:"
   tail -n 20 "$LOG" 2>/dev/null
@@ -79,6 +183,21 @@ start() {
 
 stop() {
   local pid i
+  mkdir -p "$RUN_DIR"
+  touch "$STOPFILE"
+  # The supervisor first, so it cannot restart the daemon; it forwards
+  # SIGTERM to the daemon and waits for it to exit.
+  if pid=$(supervisor_pid); then
+    kill -TERM "$pid" 2>/dev/null
+    for i in $(seq 1 60); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null
+    fi
+  fi
+  rm -f "$SUPPIDFILE"
   if pid=$(running_pid); then
     kill -TERM "$pid" 2>/dev/null
     for i in $(seq 1 40); do
@@ -107,10 +226,18 @@ stop() {
 }
 
 status() {
-  local pid
+  local pid spid
   if pid=$(running_pid); then
-    echo "RaidMan is running (pid $pid)"
+    if spid=$(supervisor_pid); then
+      echo "RaidMan is running (pid $pid, supervised by pid $spid)"
+    else
+      echo "RaidMan is running (pid $pid, not supervised)"
+    fi
     return 0
+  fi
+  if spid=$(supervisor_pid); then
+    echo "RaidMan is not running; its supervisor (pid $spid) is restarting it"
+    return 3
   fi
   echo "RaidMan is not running"
   return 3
@@ -119,8 +246,12 @@ status() {
 case "$1" in
   start) start ;;
   stop) stop ;;
-  restart) stop; start ;;
+  restart)
+    stop
+    start
+    ;;
   status) status ;;
+  supervise) supervise ;;
   *)
     echo "Usage: $0 {start|stop|restart|status}"
     exit 1

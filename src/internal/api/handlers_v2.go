@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/routecore/raidman-plugin/src/internal/service/array"
@@ -43,6 +44,8 @@ var Features = []string{
 	"plugins.list",
 	"plugins.ops",
 	"disks.smart",
+	// GET /api/disks/smart requires DISK:READ_ANY (was ARRAY:READ_ANY).
+	"disks.smart.disk",
 	"files",
 	"mem.breakdown",
 	"ups.nut",
@@ -110,6 +113,108 @@ var (
 	updateCheckRunning = docker.UpdateCheckRunning
 )
 
+// ---- update-check outcome ---------------------------------------------------
+//
+// service/docker only says whether a check it started is still running. The
+// API remembers when the last check it started stopped running, so
+// GET /api/docker/updates can still say how that check ended once "running"
+// is gone. Response headers (in-memory state: none after a daemon restart, so
+// absence stays "unknown", never "succeeded"):
+//
+//	X-Raidman-Update-Check:          running | done | failed
+//	X-Raidman-Update-Check-Started:  RFC 3339 (done/failed)
+//	X-Raidman-Update-Check-Finished: RFC 3339 (done/failed)
+//	X-Raidman-Update-Check-Error:    reason (failed only)
+//
+// Limitation: the exit status of dockerMan's script stays inside
+// service/docker, so only a check stopped at docker.UpdateCheckTimeout is
+// "failed" here; a script that exits non-zero early still reads as "done".
+
+// updateCheckPoll is how often a watcher looks at updateCheckRunning (var for
+// tests).
+var updateCheckPoll = 2 * time.Second
+
+// updateCheckTimeoutSlack absorbs the gap between the check's deadline (set
+// just before the process starts) and the start time recorded here.
+const updateCheckTimeoutSlack = 5 * time.Second
+
+const updateCheckTimedOut = "timed out"
+
+// updateCheckState is the last check this daemon started. gen is 0 until one
+// has started; finished is zero while it runs. Writes to the state and the
+// running/not-running decision happen under mu, and the trigger runs under mu
+// too, so a poll can never settle a check that is only just starting.
+var updateCheckState struct {
+	mu       sync.Mutex
+	gen      uint64
+	started  time.Time
+	limit    time.Duration
+	finished time.Time
+	failed   bool
+	msg      string
+}
+
+// settleUpdateCheckLocked records that check gen stopped at now, unless it
+// is still running, superseded or already settled. It reports whether there
+// is nothing left to watch. updateCheckState.mu must be held.
+func settleUpdateCheckLocked(gen uint64, running func() bool, now time.Time) bool {
+	st := &updateCheckState
+	if gen == 0 || gen != st.gen || !st.finished.IsZero() {
+		return true
+	}
+	if running() {
+		return false
+	}
+	st.finished = now
+	if now.Sub(st.started) >= st.limit-updateCheckTimeoutSlack {
+		st.failed, st.msg = true, updateCheckTimedOut
+	}
+	return true
+}
+
+// watchUpdateCheck settles check gen soon after it stops running, so the
+// finish time is right even when nobody polls for a while.
+func watchUpdateCheck(ctx context.Context, gen uint64, running func() bool, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		updateCheckState.mu.Lock()
+		stop := settleUpdateCheckLocked(gen, running, time.Now())
+		updateCheckState.mu.Unlock()
+		if stop {
+			return
+		}
+	}
+}
+
+// setUpdateCheckHeaders sets the X-Raidman-Update-Check* headers.
+func setUpdateCheckHeaders(h http.Header) {
+	st := &updateCheckState
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if updateCheckRunning() {
+		h.Set("X-Raidman-Update-Check", "running")
+		return
+	}
+	settleUpdateCheckLocked(st.gen, updateCheckRunning, time.Now())
+	if st.gen == 0 || st.finished.IsZero() {
+		return
+	}
+	outcome := "done"
+	if st.failed {
+		outcome = "failed"
+		h.Set("X-Raidman-Update-Check-Error", st.msg)
+	}
+	h.Set("X-Raidman-Update-Check", outcome)
+	h.Set("X-Raidman-Update-Check-Started", st.started.UTC().Format(time.RFC3339))
+	h.Set("X-Raidman-Update-Check-Finished", st.finished.UTC().Format(time.RFC3339))
+}
+
 func (a *Api) handleDockerUpdates(w http.ResponseWriter, r *http.Request, _ *auth.Key, _ authSource) {
 	ctx, cancel := context.WithTimeout(r.Context(), dockerReadTimeout)
 	defer cancel()
@@ -118,14 +223,30 @@ func (a *Api) handleDockerUpdates(w http.ResponseWriter, r *http.Request, _ *aut
 		writeJSONError(w, http.StatusInternalServerError, "docker: "+err.Error())
 		return
 	}
-	if updateCheckRunning() {
-		w.Header().Set("X-Raidman-Update-Check", "running")
-	}
+	setUpdateCheckHeaders(w.Header())
 	writeJSON(w, http.StatusOK, list)
 }
 
 func (a *Api) handleDockerUpdateCheck(w http.ResponseWriter, _ *http.Request, k *auth.Key, _ authSource) {
+	st := &updateCheckState
+	st.mu.Lock()
 	already, err := triggerUpdateCheck(a.baseCtx)
+	var gen uint64
+	if err == nil && !already {
+		st.gen++
+		gen = st.gen
+		st.started, st.limit = time.Now(), docker.UpdateCheckTimeout
+		st.finished, st.failed, st.msg = time.Time{}, false, ""
+	}
+	st.mu.Unlock()
+	if gen != 0 {
+		ctx := a.baseCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		// The watcher gets the current hooks, never reads the package vars.
+		go watchUpdateCheck(ctx, gen, updateCheckRunning, updateCheckPoll)
+	}
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, docker.ErrCheckUnavailable) {
@@ -182,7 +303,7 @@ func (a *Api) handleDisksSpin(w http.ResponseWriter, r *http.Request, k *auth.Ke
 	defer cancel()
 	if err := array.Spin(ctx, req.Disk, req.Action); err != nil {
 		log.Printf("[AUDIT] Spin %s %q FAILED by key %s: %v", req.Action, req.Disk, k.Label(), err)
-		writeJSONError(w, array.StatusOf(err), err.Error())
+		writeHTTPError(w, arrayHTTPError(err))
 		return
 	}
 	log.Printf("[AUDIT] Spin %s %q by key %s", req.Action, req.Disk, k.Label())
@@ -236,7 +357,7 @@ func (a *Api) handleParityAction(w http.ResponseWriter, r *http.Request, k *auth
 	defer cancel()
 	if err := array.ParityAction(ctx, req.Action, req.Correct); err != nil {
 		log.Printf("[AUDIT] Parity %q (correct=%v) FAILED by key %s: %v", req.Action, req.Correct, k.Label(), err)
-		writeJSONError(w, array.StatusOf(err), err.Error())
+		writeHTTPError(w, arrayHTTPError(err))
 		return
 	}
 	log.Printf("[AUDIT] Parity %q (correct=%v) by key %s", req.Action, req.Correct, k.Label())

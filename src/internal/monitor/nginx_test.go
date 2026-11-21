@@ -15,6 +15,9 @@ func newTestMonitor(t *testing.T, content string, validate func() error) (*Nginx
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, RaidmanConfFile), []byte("location /raidman/ {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	reloads := 0
 	m := &NginxMonitor{confDir: dir, validate: validate, reload: func() error { reloads++; return nil }}
 	return m, path, &reloads
@@ -35,7 +38,7 @@ func TestInjectOnce(t *testing.T) {
 	if info.Mode().Perm() != 0o644 {
 		t.Fatalf("mode = %v", info.Mode())
 	}
-	if entries, _ := os.ReadDir(filepath.Dir(path)); len(entries) != 1 {
+	if entries, _ := os.ReadDir(filepath.Dir(path)); len(entries) != 2 { // locations.conf + raidman.conf
 		t.Fatalf("temp files left behind: %v", entries)
 	}
 }

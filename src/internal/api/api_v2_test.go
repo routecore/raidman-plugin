@@ -218,8 +218,8 @@ func TestV2ErrorShape(t *testing.T) {
 			t.Errorf("%s %s: %d %q", c.path, c.body, code, body)
 		}
 	}
-	// Unknown disk: 404.
-	if code, body := doReq(t, h, "POST", "/api/disks/spin", `{"disk":"disk42","action":"up"}`, keyAdmin); code != http.StatusNotFound {
+	// Unknown disk: 422 with code "not_found" (a 404 reads as "plugin outdated").
+	if code, body := doReq(t, h, "POST", "/api/disks/spin", `{"disk":"disk42","action":"up"}`, keyAdmin); code != http.StatusUnprocessableEntity || !strings.Contains(string(body), `"code":"not_found"`) {
 		t.Errorf("unknown disk: %d %q", code, body)
 	}
 	// Wrong state: 409 (nothing to pause).
@@ -276,10 +276,10 @@ func TestV2ResponseShapes(t *testing.T) {
 	if err := json.Unmarshal(body, &health); err != nil {
 		t.Fatal(err)
 	}
-	if health.Version != "2026.11.18" || health.Protocol != 2 || health.Unraid == nil || *health.Unraid != "7.2.0" || len(health.Features) != 17 || health.HostTerminal == nil {
+	if health.Version != "2026.11.18" || health.Protocol != 2 || health.Unraid == nil || *health.Unraid != "7.2.0" || len(health.Features) != 18 || health.HostTerminal == nil {
 		t.Fatalf("health = %s", body)
 	}
-	for _, f := range []string{"docker.updates", "docker.meta", "disks.state", "disks.spin", "mover", "parity.v2", "power", "terminal.resize", "vm.reset", "vm.ips", "vm.hostdevs", "plugins.list", "plugins.ops", "disks.smart", "files", "mem.breakdown", "ups.nut"} {
+	for _, f := range []string{"docker.updates", "docker.meta", "disks.state", "disks.spin", "mover", "parity.v2", "power", "terminal.resize", "vm.reset", "vm.ips", "vm.hostdevs", "plugins.list", "plugins.ops", "disks.smart", "disks.smart.disk", "files", "mem.breakdown", "ups.nut"} {
 		if !strings.Contains(string(body), `"`+f+`"`) {
 			t.Errorf("health missing feature %s", f)
 		}

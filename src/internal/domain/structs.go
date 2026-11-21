@@ -156,6 +156,29 @@ type ArrayStatus struct {
 	// have several). Optional; older plugin versions omit it.
 	BootDevices []ArrayDisk `json:"bootDevices,omitempty"`
 	Unassigned  []ArrayDisk `json:"unassigned"`
+	// Health is the var.ini array health (nil when var.ini is unreadable).
+	// Optional; older plugin versions omit it.
+	Health *ArrayHealth `json:"health,omitempty"`
+}
+
+// ArrayHealth mirrors the app's ArrayHealth (field names and types) so it
+// can be used as is. Values come straight from /var/local/emhttp/var.ini.
+type ArrayHealth struct {
+	ResyncPos int64 `json:"resyncPos"` // mdResyncPos (KiB)
+	ResyncDb  int64 `json:"resyncDb"`  // mdResyncDb (KiB in the last sample)
+	ResyncDt  int64 `json:"resyncDt"`  // mdResyncDt (seconds of the last sample)
+	// ResyncAction is mdResyncAction: "check P", "check P Q", "recon P",
+	// "recon D5", "clear"; null when empty.
+	ResyncAction   *string `json:"resyncAction"`
+	NumDisabled    int64   `json:"numDisabled"`
+	NumInvalid     int64   `json:"numInvalid"`
+	NumMissing     int64   `json:"numMissing"`
+	FsState        *string `json:"fsState"`
+	FsProgress     *string `json:"fsProgress"`
+	FsCopyPercent  int64   `json:"fsCopyPercent"` // fsCopyPrcnt
+	NumUnmountable int64   `json:"numUnmountable"`
+	MoverActive    bool    `json:"moverActive"` // shareMoverActive
+	SafeMode       bool    `json:"safeMode"`
 }
 
 type ParityCheckStatus struct {
@@ -164,7 +187,7 @@ type ParityCheckStatus struct {
 	Paused          bool   `json:"paused"`
 	Progress        string `json:"progress"` // "0.0" to "100.0"
 	Speed           string `json:"speed"`    // e.g. "120.5 MB/s" or just number
-	Duration        int64  `json:"duration"` // Seconds
+	Duration        int64  `json:"duration"` // Seconds: now-sbSynced while running/paused, sbSynced2-sbSynced (last op) when idle
 	Date            string `json:"date"`     // Unix Timestamp or Date String
 	Errors          int64  `json:"errors"`
 	ErrorsThisCheck int64  `json:"errorsThisCheck"` // Errors found during current check
@@ -176,6 +199,11 @@ type ParityCheckStatus struct {
 	// runs (false when idle) and is always sent: its presence tells the app the errors are
 	// sbSyncErrs-based (older plugins put the mdResyncCorr flag in Errors).
 	Correcting bool `json:"correcting"`
+
+	// Action is the raw mdResyncAction of the running or paused operation
+	// ("check P", "recon D1", "clear", ...); omitted when idle. It tells a
+	// rebuild or clear apart from a parity check.
+	Action string `json:"action,omitempty"`
 }
 
 type ArrayDisk struct {

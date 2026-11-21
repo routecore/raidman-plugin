@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,8 +148,29 @@ func (a *Api) handleDiskSmart(w http.ResponseWriter, r *http.Request, _ *auth.Ke
 
 // ---- files ------------------------------------------------------------------
 
+// handleFilesList serves one page of a directory. offset (>= 0, default 0)
+// and limit (1..files.MaxEntries, default files.MaxEntries) are optional;
+// without them the response is the first page, as before paging existed.
 func (a *Api) handleFilesList(w http.ResponseWriter, r *http.Request, _ *auth.Key, _ authSource) {
-	l, err := files.List(r.URL.Query().Get("path"))
+	q := r.URL.Query()
+	var opt files.ListOptions
+	if v := q.Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeJSONError(w, http.StatusBadRequest, "invalid offset")
+			return
+		}
+		opt.Offset = n
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > files.MaxEntries {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid limit (1-%d)", files.MaxEntries))
+			return
+		}
+		opt.Limit = n
+	}
+	l, err := files.ListContext(r.Context(), q.Get("path"), opt)
 	if err != nil {
 		writeServiceError(w, err)
 		return

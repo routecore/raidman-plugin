@@ -2,8 +2,12 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -31,9 +35,26 @@ type AllowPolicy func() (restrict bool, allowed []string)
 
 type fileEntry struct {
 	key   *Key
-	mtime time.Time
-	size  int64
+	sum   [32]byte  // SHA-256 of the file content the entry was built from
 	since time.Time // failed entries: when the file first failed to parse
+}
+
+// maxKeyFileSize bounds how much of one key file is read. Upstream key files
+// are a few hundred bytes; anything larger is refused as invalid.
+const maxKeyFileSize = 64 << 10
+
+// readKeyFile reads a key file and returns its content and SHA-256.
+func readKeyFile(path string) ([]byte, [32]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, [32]byte{}, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxKeyFileSize+1))
+	if err != nil {
+		return nil, [32]byte{}, err
+	}
+	return data, sha256.Sum256(data), nil
 }
 
 // parseGrace is how long a key whose file became unparseable keeps working
@@ -110,15 +131,26 @@ func (s *Store) Reload() {
 			continue
 		}
 		path := filepath.Join(s.dir, name)
-		info, err := os.Stat(path)
+		// Changes are detected by content, not mtime/size: vfat keeps mtime
+		// at 2-second granularity, so a same-length rewrite (ADMIN ->
+		// GUEST) can leave both unchanged. Key files are tiny, so reading
+		// them all on every reload is cheap.
+		data, sum, err := readKeyFile(path)
 		if err != nil {
-			continue // vanished between ReadDir and Stat
+			if errors.Is(err, fs.ErrNotExist) {
+				continue // vanished between ReadDir and open
+			}
+			log.Printf("[AUTH] Could not read key file %s: %v", name, err)
+			if old, ok := prev[name]; ok {
+				next[name] = old
+			}
+			continue
 		}
-		if old, ok := prev[name]; ok && old.mtime.Equal(info.ModTime()) && old.size == info.Size() {
+		if old, ok := prev[name]; ok && old.sum == sum {
 			next[name] = old
 			continue
 		}
-		if f, ok := prevFailed[name]; ok && f.mtime.Equal(info.ModTime()) && f.size == info.Size() {
+		if f, ok := prevFailed[name]; ok && f.sum == sum {
 			// Same broken file as last time: already logged.
 			failed[name] = f
 			if old, ok := prev[name]; ok {
@@ -132,21 +164,19 @@ func (s *Store) Reload() {
 			continue
 		}
 		changed = true
-		data, err := os.ReadFile(path)
-		if err != nil {
-			log.Printf("[AUTH] Could not read key file %s: %v", name, err)
-			if old, ok := prev[name]; ok {
-				next[name] = old
-			}
-			continue
+		var k *Key
+		var warnings []string
+		if len(data) > maxKeyFileSize {
+			err = fmt.Errorf("file larger than %d bytes", maxKeyFileSize)
+		} else {
+			k, warnings, err = ParseKey(data)
 		}
-		k, warnings, err := ParseKey(data)
 		if err != nil {
 			since := time.Now()
 			if f, ok := prevFailed[name]; ok {
 				since = f.since
 			}
-			failed[name] = fileEntry{mtime: info.ModTime(), size: info.Size(), since: since}
+			failed[name] = fileEntry{sum: sum, since: since}
 			if old, ok := prev[name]; ok && time.Since(since) < parseGrace {
 				log.Printf("[AUTH] Could not parse key file %s (%v); keeping previous version until it is valid", name, err)
 				next[name] = old
@@ -158,13 +188,8 @@ func (s *Store) Reload() {
 		for _, w := range warnings {
 			log.Printf("[AUTH] Key file %s: %s", name, w)
 		}
-		if k.ID == "" {
-			// Upstream names key files "<id>.json"; the settings page uses
-			// the same fallback for the allowlist.
-			k.ID = strings.TrimSuffix(name, ".json")
-		}
 		log.Printf("[AUTH] Key %s from %s: %s", k.Label(), name, describeGrants(k))
-		next[name] = fileEntry{key: k, mtime: info.ModTime(), size: info.Size()}
+		next[name] = fileEntry{key: k, sum: sum}
 	}
 
 	if len(next) != len(prev) {

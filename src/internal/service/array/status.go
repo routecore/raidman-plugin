@@ -7,19 +7,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/routecore/raidman-plugin/src/internal/domain"
 )
 
-// State tracking for parity check during current check
-var (
-	parityCheckMu         sync.Mutex
-	parityCheckWasRunning bool
-	startingErrorCount    int64
-	parityCheckStartTime  int64 // Unix timestamp when check started
-)
+// nowFunc is the clock for parity durations (replaced in tests).
+var nowFunc = time.Now
 
 func GetArrayStatus() (*domain.ArrayStatus, error) {
 	return getArrayStatusWithPaths(VarIniPath, DisksIniPath, DevsIniPath)
@@ -97,8 +91,13 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 		// mdResyncCorr is only the 0/1 "correcting" flag of the running operation.
 		errs = parseInt("sbSyncErrs")
 		// NOTE: mdResyncDt is delta time between Unraid updates (~30s), NOT total elapsed.
-		// We calculate actual elapsed from pos/speed later.
-		dur = 0 // Will be calculated from pos/speed if running
+		// Elapsed time comes from sbSynced (start of the current/last operation)
+		// and sbSynced2 (its end, 0 while running), like unraid-api's
+		// parity-check-status.ts, so it survives daemon restarts.
+		synced, synced2 := parseInt("sbSynced"), parseInt("sbSynced2")
+		if synced > 0 && synced2 >= synced {
+			dur = synced2 - synced // idle: length of the last operation
+		}
 		// For speed calc
 		dTime = parseInt("mdResyncDt")
 		dBlocks = parseInt("mdResyncDb")
@@ -106,7 +105,8 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 		status.ParityCheckStatus.Total = total
 		status.ParityCheckStatus.Pos = pos
 		status.ParityCheckStatus.Errors = errs
-		status.ParityCheckStatus.Duration = dur // Placeholder, updated below if running
+		status.ParityCheckStatus.Duration = dur // replaced below while running
+		status.Health = healthFromVars(varMap, parseInt)
 
 		// sbSynced is the timestamp of the last check.
 		// If it's missing or empty, default to "0" to indicate "never".
@@ -185,30 +185,22 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 			pct := float64(pos) / float64(total) * 100.0
 			status.ParityCheckStatus.Progress = fmt.Sprintf("%.1f", pct)
 
-			// Track state during this check
-			parityCheckMu.Lock()
-			if !parityCheckWasRunning {
-				// Check just started, capture starting error count and start time
-				startingErrorCount = errs
-				parityCheckStartTime = time.Now().Unix()
-				parityCheckWasRunning = true
+			status.ParityCheckStatus.Action = varMap["mdResyncAction"]
+
+			// sbSynced is set when the operation starts and sbSyncErrs
+			// counts the errors of that operation.
+			status.ParityCheckStatus.Duration = 0
+			if synced > 0 {
+				if elapsed := nowFunc().Unix() - synced; elapsed > 0 {
+					status.ParityCheckStatus.Duration = elapsed
+				}
 			}
-			// Calculate elapsed time from actual start timestamp
-			status.ParityCheckStatus.Duration = time.Now().Unix() - parityCheckStartTime
-			status.ParityCheckStatus.ErrorsThisCheck = errs - startingErrorCount
-			parityCheckMu.Unlock()
+			status.ParityCheckStatus.ErrorsThisCheck = errs
 		} else {
 			status.ParityCheckStatus.Running = false
 			status.ParityCheckStatus.Status = "IDLE"
 			// If total > 0, we finished one? Or just idle.
 			status.ParityCheckStatus.Progress = "100.0"
-
-			// Reset tracking when check finishes
-			parityCheckMu.Lock()
-			parityCheckWasRunning = false
-			startingErrorCount = 0
-			parityCheckStartTime = 0
-			parityCheckMu.Unlock()
 		}
 	}
 
@@ -412,6 +404,41 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 	return status, nil
 }
 
+// healthFromVars builds the array health from var.ini (see the app's
+// mapHealth and unraid-api's var.ini parser).
+func healthFromVars(v map[string]string, parseInt func(string) int64) *domain.ArrayHealth {
+	str := func(key string) *string {
+		if val := v[key]; val != "" {
+			return &val
+		}
+		return nil
+	}
+	return &domain.ArrayHealth{
+		ResyncPos:      parseInt("mdResyncPos"),
+		ResyncDb:       parseInt("mdResyncDb"),
+		ResyncDt:       parseInt("mdResyncDt"),
+		ResyncAction:   str("mdResyncAction"),
+		NumDisabled:    parseInt("mdNumDisabled"),
+		NumInvalid:     parseInt("mdNumInvalid"),
+		NumMissing:     parseInt("mdNumMissing"),
+		FsState:        str("fsState"),
+		FsProgress:     str("fsProgress"),
+		FsCopyPercent:  parseInt("fsCopyPrcnt"),
+		NumUnmountable: parseInt("fsNumUnmountable"),
+		MoverActive:    iniBool(v["shareMoverActive"]),
+		SafeMode:       iniBool(v["safeMode"]),
+	}
+}
+
+// iniBool parses an emhttp yes/no (or true/false) value; anything else is false.
+func iniBool(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "yes", "true":
+		return true
+	}
+	return false
+}
+
 // selectBoot mirrors unraid-api core/modules/array/get-array-data.ts:
 // internal boot slots (type "Boot", Unraid 7.3+) win over the USB flash; among
 // candidates prefer the one mounted at /boot, then the first present device,
@@ -606,43 +633,36 @@ func CalculateSpeeds(curr *domain.ArrayStatus, prev *domain.ArrayStatus, deltaSe
 
 	prevMap := mapDisks(prev)
 
+	// Counters can go backwards (device re-enumerated after a USB reset,
+	// stats cleared); such a sample yields no speed instead of a negative one.
+	apply := func(d *domain.ArrayDisk, p domain.ArrayDisk) {
+		// READS
+		if d.ReadBytes > 0 && p.ReadBytes > 0 {
+			if diff := float64(d.ReadBytes - p.ReadBytes); diff >= 0 {
+				d.ReadSpeed = diff / deltaSeconds
+			}
+		} else if diff := float64(d.NumReads - p.NumReads); diff >= 0 {
+			// Fallback: Estimate 4KB per IO
+			d.ReadSpeed = (diff * 4096.0) / deltaSeconds
+		}
+
+		// WRITES
+		if d.WriteBytes > 0 && p.WriteBytes > 0 {
+			if diff := float64(d.WriteBytes - p.WriteBytes); diff >= 0 {
+				d.WriteSpeed = diff / deltaSeconds
+			}
+		} else if diff := float64(d.NumWrites - p.NumWrites); diff >= 0 {
+			d.WriteSpeed = (diff * 4096.0) / deltaSeconds
+		}
+	}
+
 	updateSpeed := func(d *domain.ArrayDisk) {
 		key := d.Name
-		if d.Name == "" {
+		if key == "" {
 			key = d.Id
-		} // Fallback
-		if curr.Boot != nil && d.Id == "flash" {
-			key = "boot"
-		} // Special case for boot being pointer math
-
+		}
 		if p, ok := prevMap[key]; ok {
-			// READS
-			if d.ReadBytes > 0 && p.ReadBytes > 0 {
-				diff := float64(d.ReadBytes - p.ReadBytes)
-				if diff >= 0 {
-					d.ReadSpeed = diff / deltaSeconds
-				}
-			} else {
-				// Fallback: Estimate 4KB per IO
-				diff := float64(d.NumReads - p.NumReads)
-				if diff >= 0 {
-					d.ReadSpeed = (diff * 4096.0) / deltaSeconds
-				}
-			}
-
-			// WRITES
-			if d.WriteBytes > 0 && p.WriteBytes > 0 {
-				diff := float64(d.WriteBytes - p.WriteBytes)
-				if diff >= 0 {
-					d.WriteSpeed = diff / deltaSeconds
-				}
-			} else {
-				// Fallback
-				diff := float64(d.NumWrites - p.NumWrites)
-				if diff >= 0 {
-					d.WriteSpeed = (diff * 4096.0) / deltaSeconds
-				}
-			}
+			apply(d, p)
 		}
 	}
 
@@ -659,20 +679,9 @@ func CalculateSpeeds(curr *domain.ArrayStatus, prev *domain.ArrayStatus, deltaSe
 		updateSpeed(&curr.Unassigned[i])
 	}
 	if curr.Boot != nil {
-		// Boot is a pointer, keys match "boot" in map
+		// Boot is keyed "boot" in prevMap whatever its name (flash or a 7.3 boot slot).
 		if p, ok := prevMap["boot"]; ok {
-			d := curr.Boot
-
-			if d.ReadBytes > 0 && p.ReadBytes > 0 {
-				d.ReadSpeed = float64(d.ReadBytes-p.ReadBytes) / deltaSeconds
-			} else {
-				d.ReadSpeed = float64(d.NumReads-p.NumReads) * 4096.0 / deltaSeconds
-			}
-			if d.WriteBytes > 0 && p.WriteBytes > 0 {
-				d.WriteSpeed = float64(d.WriteBytes-p.WriteBytes) / deltaSeconds
-			} else {
-				d.WriteSpeed = float64(d.NumWrites-p.NumWrites) * 4096.0 / deltaSeconds
-			}
+			apply(curr.Boot, p)
 		}
 	}
 }

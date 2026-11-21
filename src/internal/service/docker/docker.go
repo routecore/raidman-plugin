@@ -12,7 +12,6 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/docker/go-units"
 )
 
 type ContainerStats struct {
@@ -20,14 +19,35 @@ type ContainerStats struct {
 	CPUPerc  string `json:"CPUPerc"`
 	MemPerc  string `json:"MemPerc"`
 	MemUsage string `json:"MemUsage"`
+	// NetIO is "rx / tx" summed over all networks (docker stats format);
+	// omitted when the container has no network stats (host/none mode).
+	NetIO string `json:"NetIO,omitempty"`
+	// BlockIO is "read / write" bytes (docker stats format).
+	BlockIO string `json:"BlockIO,omitempty"`
 }
 
 type StatsJSON struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	CPUStats    CPUStats    `json:"cpu_stats"`
-	PreCPUStats CPUStats    `json:"precpu_stats"`
-	MemoryStats MemoryStats `json:"memory_stats"`
+	ID          string                  `json:"id"`
+	Name        string                  `json:"name"`
+	CPUStats    CPUStats                `json:"cpu_stats"`
+	PreCPUStats CPUStats                `json:"precpu_stats"`
+	MemoryStats MemoryStats             `json:"memory_stats"`
+	Networks    map[string]NetworkStats `json:"networks"`
+	BlkioStats  BlkioStats              `json:"blkio_stats"`
+}
+
+type NetworkStats struct {
+	RxBytes uint64 `json:"rx_bytes"`
+	TxBytes uint64 `json:"tx_bytes"`
+}
+
+type BlkioStats struct {
+	IoServiceBytesRecursive []BlkioEntry `json:"io_service_bytes_recursive"`
+}
+
+type BlkioEntry struct {
+	Op    string `json:"op"`
+	Value uint64 `json:"value"`
 }
 
 type CPUStats struct {
@@ -107,138 +127,6 @@ func ExecuteContainerAction(ctx context.Context, containerID string, action stri
 	}
 	invalidateAll()
 	return wrapNotFound(err)
-}
-
-// statsConcurrency only guards against pathological container counts; each
-// stats call waits ~1s for its second sample, so a low bound would slow the
-// all-containers stream down.
-const statsConcurrency = 64
-
-// GetContainerStats returns CPU/memory usage for one container (containerID
-// non-empty) or for all running containers. For a single container, a missing
-// container returns ErrNotFound so the caller can report it instead of
-// silently polling forever.
-func GetContainerStats(ctx context.Context, containerID string) ([]ContainerStats, error) {
-	cli, err := getDockerClient()
-	if err != nil {
-		return nil, err
-	}
-
-	var ids []string
-	if containerID != "" {
-		// A stopped container never sends a second stats sample; report
-		// zero usage instead of blocking until the timeout.
-		insp, err := cli.ContainerInspect(ctx, containerID)
-		if err != nil {
-			return nil, wrapNotFound(err)
-		}
-		if insp.State == nil || !insp.State.Running {
-			return []ContainerStats{{ID: insp.ID, CPUPerc: "0.00%", MemPerc: "0.00%", MemUsage: "0B / 0B"}}, nil
-		}
-		ids = []string{insp.ID}
-	} else {
-		list, err := cli.ContainerList(ctx, container.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-		for _, c := range list {
-			ids = append(ids, c.ID)
-		}
-	}
-
-	results := make([]ContainerStats, len(ids))
-	errs := make([]error, len(ids))
-	sem := make(chan struct{}, statsConcurrency)
-	var wg sync.WaitGroup
-	for i, id := range ids {
-		wg.Add(1)
-		go func(i int, id string) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				errs[i] = ctx.Err()
-				return
-			}
-			defer func() { <-sem }()
-			results[i], errs[i] = statsFor(ctx, cli, id)
-		}(i, id)
-	}
-	wg.Wait()
-
-	if containerID != "" {
-		if errs[0] != nil {
-			return nil, errs[0]
-		}
-		return results, nil
-	}
-	out := make([]ContainerStats, 0, len(results))
-	for i, r := range results {
-		if errs[i] == nil && r.ID != "" {
-			out = append(out, r)
-		}
-	}
-	return out, ctx.Err()
-}
-
-func statsFor(ctx context.Context, cli *client.Client, id string) (ContainerStats, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	// Streaming stats: the second frame carries both current and previous
-	// CPU samples, which the CPU percentage needs. The context bounds it.
-	stats, err := cli.ContainerStats(ctx, id, true)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ContainerStats{}, ctx.Err()
-		}
-		return ContainerStats{}, wrapNotFound(err)
-	}
-	defer stats.Body.Close()
-
-	var s StatsJSON
-	dec := json.NewDecoder(stats.Body)
-	if err := dec.Decode(&s); err != nil {
-		if ctx.Err() != nil {
-			return ContainerStats{}, ctx.Err()
-		}
-		return ContainerStats{}, err
-	}
-	if s.PreCPUStats.CPUUsage.TotalUsage == 0 {
-		var second StatsJSON
-		if err := dec.Decode(&second); err == nil {
-			s = second
-		}
-	}
-
-	cpuPercent := 0.0
-	cpuDelta := float64(s.CPUStats.CPUUsage.TotalUsage) - float64(s.PreCPUStats.CPUUsage.TotalUsage)
-	systemDelta := float64(s.CPUStats.SystemUsage) - float64(s.PreCPUStats.SystemUsage)
-	if systemDelta > 0.0 && cpuDelta > 0.0 {
-		onlineCPUs := float64(s.CPUStats.OnlineCPUs)
-		if onlineCPUs == 0.0 {
-			onlineCPUs = float64(len(s.CPUStats.CPUUsage.PercpuUsage))
-		}
-		cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
-	}
-
-	memUsage := float64(s.MemoryStats.Usage)
-	if cache, ok := s.MemoryStats.Stats["cache"]; ok {
-		memUsage -= float64(cache)
-	} else if inactive, ok := s.MemoryStats.Stats["inactive_file"]; ok {
-		memUsage -= float64(inactive)
-	}
-	memLimit := float64(s.MemoryStats.Limit)
-	memPercent := 0.0
-	if memLimit > 0 {
-		memPercent = (memUsage / memLimit) * 100.0
-	}
-
-	return ContainerStats{
-		ID:       id,
-		CPUPerc:  fmt.Sprintf("%.2f%%", cpuPercent),
-		MemPerc:  fmt.Sprintf("%.2f%%", memPercent),
-		MemUsage: fmt.Sprintf("%s / %s", units.HumanSize(memUsage), units.HumanSize(memLimit)),
-	}, nil
 }
 
 // ---- container list -------------------------------------------------------
