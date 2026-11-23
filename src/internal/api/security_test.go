@@ -354,3 +354,34 @@ func TestLogStreamIgnoresInput(t *testing.T) {
 		t.Fatalf("input reached the log PTY: %q", got.String())
 	}
 }
+
+// The session cookie is Secure when nginx or a proxy/tunnel in front of it
+// was reached over HTTPS (X-Raidman-Client-Proto from raidman.conf).
+func TestSessionCookieSecureBehindProxy(t *testing.T) {
+	a, _ := newTestApi(t)
+	h, err := a.Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		hdr, val string
+		want     bool
+	}{{"", "", false}, {"X-Forwarded-Proto", "https", true}, {"X-Raidman-Client-Proto", "HTTPS", true}, {"X-Raidman-Client-Proto", "http", false}} {
+		req := httptest.NewRequest(http.MethodGet, "/raidman/novnc/vnc.html", nil)
+		req.Header.Set("x-api-key", keyAdmin)
+		if tc.hdr != "" {
+			req.Header.Set(tc.hdr, tc.val)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var got *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == sessionCookieName {
+				got = c
+			}
+		}
+		if got == nil || got.Secure != tc.want {
+			t.Errorf("%s=%q: cookie %+v, want Secure=%v", tc.hdr, tc.val, got, tc.want)
+		}
+	}
+}

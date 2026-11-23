@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/routecore/raidman-plugin/src/internal/service/array"
 	"github.com/routecore/raidman-plugin/src/internal/service/auth"
@@ -393,7 +394,11 @@ func (a *Api) handleNoVNC(w http.ResponseWriter, r *http.Request, k *auth.Key, s
 	// work without the key itself ever being stored in a plugin cookie.
 	if (src == authHeader || src == authKeyCookie) && !a.hasSessionFor(r, k) {
 		if id, err := a.sessions.create(k.Hash()); err == nil {
-			isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+			// Secure when nginx was reached over HTTPS, or a proxy/tunnel in
+			// front of it was (X-Raidman-Client-Proto, set by raidman.conf).
+			// Only ever adds the flag, so a spoofed value cannot weaken it.
+			isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" ||
+				strings.EqualFold(r.Header.Get("X-Raidman-Client-Proto"), "https")
 			http.SetCookie(w, &http.Cookie{
 				Name:     sessionCookieName,
 				Value:    id,

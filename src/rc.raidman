@@ -27,6 +27,9 @@ BACKOFF_MIN=${RAIDMAN_BACKOFF_MIN:-2}
 BACKOFF_MAX=60
 HEALTHY_SECS=60
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+# The plugin manager and web terminal run with umask 000; never create a
+# world-writable log or pid file.
+umask 022
 
 running_pid() {
   local pid
@@ -162,6 +165,7 @@ start() {
   mkdir -p "$RUN_DIR"
   rm -f "$STOPFILE"
   rotate_log
+  touch "$LOG" && chmod 0644 "$LOG" "$LOG.1" 2>/dev/null
   # setsid detaches from the installer's session; all fds are redirected so
   # the plugin installer never waits on the daemon.
   setsid "$SELF" supervise </dev/null >>"$LOG" 2>&1 &
