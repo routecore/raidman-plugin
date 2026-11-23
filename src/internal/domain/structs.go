@@ -179,6 +179,10 @@ type ArrayHealth struct {
 	NumUnmountable int64   `json:"numUnmountable"`
 	MoverActive    bool    `json:"moverActive"` // shareMoverActive
 	SafeMode       bool    `json:"safeMode"`
+	// ConfigValid is var.ini configValid as emhttp writes it: "yes", or why
+	// the webGUI keeps Start disabled ("error", "invalid", "ineligible",
+	// "nokeyserver", "withdrawn"). Null when var.ini has none.
+	ConfigValid *string `json:"configValid"`
 }
 
 type ParityCheckStatus struct {

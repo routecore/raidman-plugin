@@ -96,7 +96,7 @@ func TestParityDurationAndErrorsFromVarIni(t *testing.T) {
 func TestArrayHealthFromVarIni(t *testing.T) {
 	varIni := "mdState=\"STARTED\"\nmdResyncAction=\"recon D1\"\nmdResyncPos=\"500\"\nmdResyncDb=\"3000\"\nmdResyncDt=\"30\"\n" +
 		"mdNumDisabled=\"1\"\nmdNumInvalid=\"2\"\nmdNumMissing=\"0\"\nfsState=\"Started\"\nfsProgress=\"\"\nfsCopyPrcnt=\"42\"\n" +
-		"fsNumUnmountable=\"1\"\nshareMoverActive=\"yes\"\nsafeMode=\"no\"\n"
+		"fsNumUnmountable=\"1\"\nshareMoverActive=\"yes\"\nsafeMode=\"no\"\nconfigValid=\"error\"\n"
 	p := filepath.Join(t.TempDir(), "var.ini")
 	if err := os.WriteFile(p, []byte(varIni), 0o644); err != nil {
 		t.Fatal(err)
@@ -110,7 +110,7 @@ func TestArrayHealthFromVarIni(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `{"resyncPos":500,"resyncDb":3000,"resyncDt":30,"resyncAction":"recon D1","numDisabled":1,"numInvalid":2,"numMissing":0,` +
-		`"fsState":"Started","fsProgress":null,"fsCopyPercent":42,"numUnmountable":1,"moverActive":true,"safeMode":false}`
+		`"fsState":"Started","fsProgress":null,"fsCopyPercent":42,"numUnmountable":1,"moverActive":true,"safeMode":false,"configValid":"error"}`
 	if string(b) != want {
 		t.Fatalf("health =\n%s\nwant\n%s", b, want)
 	}

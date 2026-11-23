@@ -427,6 +427,7 @@ func healthFromVars(v map[string]string, parseInt func(string) int64) *domain.Ar
 		NumUnmountable: parseInt("fsNumUnmountable"),
 		MoverActive:    iniBool(v["shareMoverActive"]),
 		SafeMode:       iniBool(v["safeMode"]),
+		ConfigValid:    str("configValid"),
 	}
 }
 
