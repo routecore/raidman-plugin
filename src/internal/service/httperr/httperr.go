@@ -13,6 +13,11 @@ import (
 // outdated". The code lets it tell "this thing is gone" apart from other 422s.
 const CodeNotFound = "not_found"
 
+// CodeSmartUnsupported marks a device smartctl cannot read SMART data from
+// (USB flash drives and unknown USB bridges, virtual disks): 501, so clients
+// show "not available" instead of an error.
+const CodeSmartUnsupported = "smart_unsupported"
+
 // Error is a service error with the HTTP status the API should answer and an
 // optional machine-readable Code (sent as "code" next to "error").
 type Error struct {

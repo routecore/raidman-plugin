@@ -68,7 +68,11 @@ type smartJSON struct {
 		Messages   []message `json:"messages"`
 		ExitStatus *int      `json:"exit_status"`
 	} `json:"smartctl"`
-	Device      *json.RawMessage `json:"device"`
+	Device       *json.RawMessage `json:"device"`
+	SmartSupport *struct {
+		Available *bool `json:"available"`
+		Enabled   *bool `json:"enabled"`
+	} `json:"smart_support"`
 	SmartStatus *struct {
 		Passed *bool `json:"passed"`
 	} `json:"smart_status"`
@@ -145,6 +149,14 @@ func firstError(msgs []message) string {
 	return ""
 }
 
+// unsupportedRe matches smartctl messages meaning the device cannot report
+// SMART at all (as opposed to a failure reading it).
+var unsupportedRe = regexp.MustCompile(`(?i)unknown usb bridge|unable to detect device type|please specify device type|smart support is:\s*unavailable|does not support smart|smart (support )?is not (available|supported)`)
+
+func unsupported(msg string) error {
+	return &httperr.Error{Status: http.StatusNotImplemented, Code: httperr.CodeSmartUnsupported, Msg: "SMART is not available for this device (" + msg + ")"}
+}
+
 // Parse turns smartctl -j output into a Report.
 func Parse(device string, stdout []byte, exitCode int) (Report, error) {
 	var j smartJSON
@@ -159,6 +171,12 @@ func Parse(device string, stdout []byte, exitCode int) (Report, error) {
 	rep := Report{Device: device, Attributes: []Attribute{}}
 
 	hasData := j.SmartStatus != nil || j.ATA != nil || len(j.NVMe) > 0 || j.Temperature != nil
+	if msg := firstError(j.Smartctl.Messages); msg != "" && unsupportedRe.MatchString(msg) {
+		return Report{}, unsupported(msg)
+	}
+	if ss := j.SmartSupport; ss != nil && ss.Available != nil && !*ss.Available && !hasData {
+		return Report{}, unsupported("SMART support unavailable")
+	}
 	if exitCode >= 0 && exitCode&1 != 0 {
 		msg := firstError(j.Smartctl.Messages)
 		if msg == "" {

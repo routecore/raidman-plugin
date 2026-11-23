@@ -147,3 +147,18 @@ func TestGet(t *testing.T) {
 		t.Errorf("bad device: %v", err)
 	}
 }
+
+func TestParseUnsupported(t *testing.T) {
+	_, err := Parse("sdf", fixture(t, "usbbridge.json"), 1)
+	if httperr.StatusOf(err) != 501 || httperr.CodeOf(err) != httperr.CodeSmartUnsupported {
+		t.Fatalf("USB bridge: %v (status %d, code %q)", err, httperr.StatusOf(err), httperr.CodeOf(err))
+	}
+	_, err = Parse("sdb", []byte(`{"smartctl":{"exit_status":4},"device":{"name":"/dev/sdb"},"smart_support":{"available":false}}`), 4)
+	if httperr.CodeOf(err) != httperr.CodeSmartUnsupported {
+		t.Fatalf("smart_support unavailable: %v", err)
+	}
+	// A real open failure stays an error, not "unsupported".
+	if _, err := Parse("sdz", fixture(t, "openfail.json"), 2); httperr.CodeOf(err) == httperr.CodeSmartUnsupported {
+		t.Fatal("open failure must not be unsupported")
+	}
+}
