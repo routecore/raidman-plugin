@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 // Paths overridable in tests.
@@ -353,8 +353,8 @@ func BuildMeta(containers []container.Summary, templates []*Template, lanIP stri
 			if d := drivers[mode]; d == "macvlan" || d == "ipvlan" {
 				ip = ""
 				if c.NetworkSettings != nil {
-					if n := c.NetworkSettings.Networks[mode]; n != nil {
-						ip = n.IPAddress
+					if n := c.NetworkSettings.Networks[mode]; n != nil && n.IPAddress.IsValid() {
+						ip = n.IPAddress.String()
 					}
 				}
 			}
@@ -411,13 +411,14 @@ func GetMeta(ctx context.Context) ([]ContainerMeta, error) {
 	if err != nil {
 		return nil, err
 	}
-	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	listed, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
+	containers := listed.Items
 	drivers := map[string]string{}
-	if nets, err := cli.NetworkList(ctx, network.ListOptions{}); err == nil {
-		for _, n := range nets {
+	if nets, err := cli.NetworkList(ctx, client.NetworkListOptions{}); err == nil {
+		for _, n := range nets.Items {
 			drivers[n.Name] = n.Driver
 		}
 	}

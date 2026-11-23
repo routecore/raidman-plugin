@@ -1,12 +1,13 @@
 package docker
 
 import (
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 )
 
 func withMetaFixtures(t *testing.T) {
@@ -110,7 +111,7 @@ func TestBuildMeta(t *testing.T) {
 		{ // template matched by name, published port remapped
 			ID: "aaa", Names: []string{"/plex"}, Image: "lscr.io/linuxserver/plex:latest",
 			Labels: map[string]string{"net.unraid.docker.managed": "dockerman"},
-			Ports:  []container.Port{{PrivatePort: 32400, PublicPort: 32400, Type: "tcp"}},
+			Ports:  []container.PortSummary{{PrivatePort: 32400, PublicPort: 32400, Type: "tcp"}},
 		},
 		{ // matched by repository; stopped -> template port mapping; label icon wins
 			ID: "bbb", Names: []string{"/cloud"}, Image: "lscr.io/linuxserver/nextcloud",
@@ -123,7 +124,7 @@ func TestBuildMeta(t *testing.T) {
 				"net.unraid.docker.webui":    "http://[IP]:[PORT:80]/",
 				"net.unraid.docker.shell":    "ash",
 			},
-			NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"br0": {IPAddress: "192.168.1.77"}}},
+			NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"br0": {IPAddress: netip.MustParseAddr("192.168.1.77")}}},
 		},
 		{ // shares another container's network: no WebUI
 			ID: "ddd", Names: []string{"/vpnclient"}, Image: "someone/weird",
@@ -138,7 +139,7 @@ func TestBuildMeta(t *testing.T) {
 		},
 		{ // running on macvlan br0: the template's 32400->32401 remap must not apply
 			ID: "ggg", Names: []string{"/plex-br0"}, Image: "lscr.io/linuxserver/plex", State: "running",
-			NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"br0": {IPAddress: "192.168.1.80"}}},
+			NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"br0": {IPAddress: netip.MustParseAddr("192.168.1.80")}}},
 		},
 		{ // running in host mode: container port, LAN IP
 			ID: "hhh", Names: []string{"/plex-host"}, Image: "lscr.io/linuxserver/plex", State: "running",

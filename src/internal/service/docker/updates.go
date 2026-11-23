@@ -13,7 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 // Paths used by Unraid's Docker manager (dockerMan). Overridable in tests.
@@ -177,10 +178,11 @@ func GetUpdates(ctx context.Context) ([]ContainerUpdate, error) {
 	if err != nil {
 		return nil, err
 	}
-	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	listed, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
+	containers := listed.Items
 	status := map[string]UpdateEntry{}
 	var checkedAt *time.Time
 	if data, err := os.ReadFile(UpdateStatusPath); err == nil {

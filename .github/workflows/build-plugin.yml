@@ -18,9 +18,8 @@ permissions:
   contents: read
 
 env:
-  # Latest patch of Go 1.26 (check-latest below). Standard-library security fixes
-  # such as GO-2026-6859 (net/http) only land on the newest lines; go.mod keeps
-  # the minimum language version.
+  # Latest patch of the Go line in go.mod (check-latest below). Standard-library
+  # security fixes such as GO-2026-6859 (net/http) only land on the newest lines.
   GO_VERSION: "1.26.x"
   GOTOOLCHAIN: local
   # noVNC shipped inside the package for the in-app VM console. The hash is

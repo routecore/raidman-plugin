@@ -5,13 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/client"
 )
 
 type ContainerStats struct {
@@ -87,7 +92,7 @@ func getDockerClient() (*client.Client, error) {
 	if shared != nil {
 		return shared, nil
 	}
-	c, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	c, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, err
 	}
@@ -95,8 +100,65 @@ func getDockerClient() (*client.Client, error) {
 	return c, nil
 }
 
+// rawInspect returns GET /containers/{id}/json exactly as the daemon sends it.
+// The moby API types decode some fields strictly (network.Port, netip.Addr):
+// one odd value, such as an image's "6881-6889/tcp" ExposedPorts key, would
+// fail the whole typed inspect and drop the container. The raw document also
+// keeps every field the daemon sends, as the old string-typed client did.
+// The path is unversioned, so the daemon answers with its own API version.
+func rawInspect(ctx context.Context, cli *client.Client, id string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/containers/"+url.PathEscape(id)+"/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := rawHTTPClient(cli).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxInspectBytes))
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
+	case resp.StatusCode != http.StatusOK:
+		return nil, fmt.Errorf("inspect %s: daemon answered %d", id, resp.StatusCode)
+	case !json.Valid(body):
+		return nil, fmt.Errorf("inspect %s: invalid JSON from the daemon", id)
+	}
+	return body, nil
+}
+
+// maxInspectBytes bounds one inspect document (normally a few KiB).
+const maxInspectBytes = 8 << 20
+
+var (
+	rawMu     sync.Mutex
+	rawFor    *client.Client
+	rawClient *http.Client
+)
+
+// rawHTTPClient speaks HTTP over the Docker client's own connection (socket,
+// TLS and custom transports as configured), one instance per Docker client.
+func rawHTTPClient(cli *client.Client) *http.Client {
+	rawMu.Lock()
+	defer rawMu.Unlock()
+	if rawFor != cli {
+		dial := cli.Dialer()
+		rawClient = &http.Client{Transport: &http.Transport{
+			DialContext:     func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
+			MaxIdleConns:    inspectConcurrency,
+			IdleConnTimeout: 30 * time.Second,
+		}}
+		rawFor = cli
+	}
+	return rawClient
+}
+
 func wrapNotFound(err error) error {
-	if err != nil && client.IsErrNotFound(err) {
+	if err != nil && cerrdefs.IsNotFound(err) {
 		return fmt.Errorf("%w: %v", ErrNotFound, err)
 	}
 	return err
@@ -111,17 +173,17 @@ func ExecuteContainerAction(ctx context.Context, containerID string, action stri
 	}
 	switch action {
 	case "start":
-		err = cli.ContainerStart(ctx, containerID, container.StartOptions{})
+		_, err = cli.ContainerStart(ctx, containerID, client.ContainerStartOptions{})
 	case "stop":
-		err = cli.ContainerStop(ctx, containerID, container.StopOptions{})
+		_, err = cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{})
 	case "restart":
-		err = cli.ContainerRestart(ctx, containerID, container.StopOptions{})
+		_, err = cli.ContainerRestart(ctx, containerID, client.ContainerRestartOptions{})
 	case "kill":
-		err = cli.ContainerKill(ctx, containerID, "KILL")
+		_, err = cli.ContainerKill(ctx, containerID, client.ContainerKillOptions{Signal: "KILL"})
 	case "pause":
-		err = cli.ContainerPause(ctx, containerID)
+		_, err = cli.ContainerPause(ctx, containerID, client.ContainerPauseOptions{})
 	case "unpause":
-		err = cli.ContainerUnpause(ctx, containerID)
+		_, err = cli.ContainerUnpause(ctx, containerID, client.ContainerUnpauseOptions{})
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidAction, action)
 	}
@@ -171,10 +233,11 @@ func GetContainers(ctx context.Context, opts ContainerOptions) ([]map[string]any
 	if err != nil {
 		return nil, err
 	}
-	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true, Size: opts.Size})
+	listed, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true, Size: opts.Size})
 	if err != nil {
 		return nil, err
 	}
+	containers := listed.Items
 	if len(containers) == 0 {
 		return []map[string]any{}, nil
 	}
@@ -189,7 +252,7 @@ func GetContainers(ctx context.Context, opts ContainerOptions) ([]map[string]any
 		cacheMu.Lock()
 		e, ok := inspectCache[c.ID]
 		cacheMu.Unlock()
-		if ok && e.state == c.State && now.Sub(e.fetched) < inspectTTL {
+		if ok && e.state == string(c.State) && now.Sub(e.fetched) < inspectTTL {
 			raw[i] = e.data
 			continue
 		}
@@ -202,19 +265,18 @@ func GetContainers(ctx context.Context, opts ContainerOptions) ([]map[string]any
 				return
 			}
 			defer func() { <-sem }()
-			insp, err := cli.ContainerInspect(ctx, id)
+			b, err := rawInspect(ctx, cli, id)
 			if err != nil {
-				return // removed between list and inspect
-			}
-			b, err := json.Marshal(insp)
-			if err != nil {
-				return
+				if !errors.Is(err, ErrNotFound) && ctx.Err() == nil {
+					log.Printf("docker: inspect %s: %v", id, err)
+				}
+				return // removed between list and inspect, or the daemon failed
 			}
 			raw[i] = b
 			cacheMu.Lock()
 			inspectCache[id] = inspectEntry{state: state, fetched: time.Now(), data: b}
 			cacheMu.Unlock()
-		}(i, c.ID, c.State)
+		}(i, c.ID, string(c.State))
 	}
 	wg.Wait()
 	if err := ctx.Err(); err != nil {

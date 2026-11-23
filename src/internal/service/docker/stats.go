@@ -8,9 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 	"github.com/docker/go-units"
+	"github.com/moby/moby/client"
 )
 
 // ---- shared stats sampler -------------------------------------------------
@@ -43,27 +42,38 @@ type statsSource interface {
 type dockerStatsSource struct{ cli *client.Client }
 
 func (d dockerStatsSource) ListRunning(ctx context.Context) ([]string, error) {
-	list, err := d.cli.ContainerList(ctx, container.ListOptions{})
+	listed, err := d.cli.ContainerList(ctx, client.ContainerListOptions{})
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]string, 0, len(list))
-	for _, c := range list {
+	ids := make([]string, 0, len(listed.Items))
+	for _, c := range listed.Items {
 		ids = append(ids, c.ID)
 	}
 	return ids, nil
 }
 
 func (d dockerStatsSource) Inspect(ctx context.Context, ref string) (string, bool, error) {
-	insp, err := d.cli.ContainerInspect(ctx, ref)
+	// Raw, like the container list: a strictly typed decode can fail on fields
+	// this never reads and would close the stats stream.
+	b, err := rawInspect(ctx, d.cli, ref)
 	if err != nil {
 		return "", false, wrapNotFound(err)
+	}
+	var insp struct {
+		ID    string `json:"Id"`
+		State *struct {
+			Running bool
+		}
+	}
+	if err := json.Unmarshal(b, &insp); err != nil {
+		return "", false, err
 	}
 	return insp.ID, insp.State != nil && insp.State.Running, nil
 }
 
 func (d dockerStatsSource) Stream(ctx context.Context, id string) (io.ReadCloser, error) {
-	r, err := d.cli.ContainerStats(ctx, id, true)
+	r, err := d.cli.ContainerStats(ctx, id, client.ContainerStatsOptions{Stream: true})
 	if err != nil {
 		return nil, wrapNotFound(err)
 	}

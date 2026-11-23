@@ -9,7 +9,7 @@
 #   - every inline script parses with bash -n, the install script carries the
 #     resolved VERSION, and no inline script downloads anything itself;
 #   - src/rc.raidman and scripts/*.sh parse with bash -n.
-# shellcheck runs too when it is installed (errors only).
+# When installed, shellcheck also runs (errors only).
 #
 # Usage: scripts/check-plg.sh [--allow-unstamped] [path/to/raidman.plg]
 #   --allow-unstamped  accept an empty <SHA256> (a plg that was never released)
