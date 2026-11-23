@@ -66,15 +66,17 @@ var contractRoutes = map[string]Requirement{
 	"/connect":               AnyKey(), // per-type checks below
 
 	// protocol 2
-	"/api/health":               AnyKey(),
-	"/api/docker/updates":       Perm(auth.ResourceDocker, auth.ActionReadAny),
-	"/api/docker/updates/check": Perm(auth.ResourceDocker, auth.ActionUpdateAny),
-	"/api/docker/meta":          Perm(auth.ResourceDocker, auth.ActionReadAny),
-	"/api/disks/state":          Perm(auth.ResourceArray, auth.ActionReadAny),
-	"/api/disks/spin":           Perm(auth.ResourceArray, auth.ActionUpdateAny),
-	"/api/mover/status":         Perm(auth.ResourceArray, auth.ActionReadAny),
-	"/api/mover/action":         Perm(auth.ResourceArray, auth.ActionUpdateAny),
-	"/api/parity/action":        Perm(auth.ResourceArray, auth.ActionUpdateAny),
+	"/api/health":                          AnyKey(),
+	"/api/docker/updates":                  Perm(auth.ResourceDocker, auth.ActionReadAny),
+	"/api/docker/updates/check":            Perm(auth.ResourceDocker, auth.ActionUpdateAny),
+	"/api/docker/meta":                     Perm(auth.ResourceDocker, auth.ActionReadAny),
+	"/api/disks/state":                     Perm(auth.ResourceArray, auth.ActionReadAny),
+	"/api/array/encryption":                Perm(auth.ResourceArray, auth.ActionReadAny),
+	"/api/array/encryption/keyfile/delete": Perm(auth.ResourceArray, auth.ActionUpdateAny),
+	"/api/disks/spin":                      Perm(auth.ResourceArray, auth.ActionUpdateAny),
+	"/api/mover/status":                    Perm(auth.ResourceArray, auth.ActionReadAny),
+	"/api/mover/action":                    Perm(auth.ResourceArray, auth.ActionUpdateAny),
+	"/api/parity/action":                   Perm(auth.ResourceArray, auth.ActionUpdateAny),
 
 	// feature wave
 	"/api/plugins":        Perm(auth.ResourceConfig, auth.ActionReadAny),
@@ -184,13 +186,13 @@ func TestAuthorizationMatrix(t *testing.T) {
 		"admin": nil, // all
 		"viewer": set("/api/vm/info", "/api/vms", "/api/vm/icon", "/novnc/", "/api/array/status",
 			"/api/array/history", "/api/docker/containers", "/connect",
-			"/api/health", "/api/docker/updates", "/api/docker/meta", "/api/disks/state", "/api/mover/status",
+			"/api/health", "/api/docker/updates", "/api/docker/meta", "/api/disks/state", "/api/array/encryption", "/api/mover/status",
 			"/api/plugins", "/api/disks/smart", "/api/system/memory", "/api/ups/nut"),
 		"guest": set("/api/vm/icon", "/novnc/", "/connect", "/api/health"),
 		"perm": set("/api/vm/icon", "/novnc/", "/api/array/status", "/api/array/history",
 			"/api/docker/containers", "/api/docker/action", "/connect",
 			"/api/health", "/api/docker/updates", "/api/docker/updates/check", "/api/docker/meta",
-			"/api/disks/state", "/api/mover/status"),
+			"/api/disks/state", "/api/array/encryption", "/api/mover/status"),
 		"vmops": set("/api/vm/icon", "/novnc/", "/api/vm/autostart", "/api/vm/action", "/connect", "/api/health"),
 		"dockerro": set("/api/vm/icon", "/novnc/", "/connect", "/api/health",
 			"/api/docker/containers", "/api/docker/updates", "/api/docker/meta"),

@@ -88,6 +88,8 @@ func (a *Api) routes() []route {
 		{Path: "/api/docker/updates/check", Methods: post, Req: Perm(auth.ResourceDocker, auth.ActionUpdateAny), Handler: a.handleDockerUpdateCheck, V2: true},
 		{Path: "/api/docker/meta", Methods: get, Req: Perm(auth.ResourceDocker, auth.ActionReadAny), Handler: a.handleDockerMeta, V2: true},
 		{Path: "/api/disks/state", Methods: get, Req: Perm(auth.ResourceArray, auth.ActionReadAny), Handler: a.handleDisksState, V2: true},
+		{Path: "/api/array/encryption", Methods: get, Req: Perm(auth.ResourceArray, auth.ActionReadAny), Handler: a.handleArrayEncryption, V2: true},
+		{Path: "/api/array/encryption/keyfile/delete", Methods: post, Req: Perm(auth.ResourceArray, auth.ActionUpdateAny), Handler: a.handleArrayKeyfileDelete, V2: true},
 		{Path: "/api/disks/spin", Methods: post, Req: Perm(auth.ResourceArray, auth.ActionUpdateAny), Handler: a.handleDisksSpin, V2: true},
 		{Path: "/api/mover/status", Methods: get, Req: Perm(auth.ResourceArray, auth.ActionReadAny), Handler: a.handleMoverStatus, V2: true},
 		{Path: "/api/mover/action", Methods: post, Req: Perm(auth.ResourceArray, auth.ActionUpdateAny), Handler: a.handleMoverAction, V2: true},

@@ -49,6 +49,9 @@ var Features = []string{
 	"files",
 	"mem.breakdown",
 	"ups.nut",
+	// GET /api/array/encryption: the webGUI's Start-array encryption status;
+	// POST /api/array/encryption/keyfile/delete: its "Delete" of a wrong keyfile.
+	"array.encryption",
 }
 
 // Paths read by /api/health (overridable in tests).
@@ -288,6 +291,30 @@ func (a *Api) handleDisksState(w http.ResponseWriter, _ *http.Request, _ *auth.K
 		return
 	}
 	writeJSON(w, http.StatusOK, disks)
+}
+
+func (a *Api) handleArrayEncryption(w http.ResponseWriter, _ *http.Request, _ *auth.Key, _ authSource) {
+	enc, err := array.GetEncryption()
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, os.ErrNotExist) {
+			status = http.StatusServiceUnavailable
+		}
+		writeJSONError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, enc)
+}
+
+func (a *Api) handleArrayKeyfileDelete(w http.ResponseWriter, _ *http.Request, k *auth.Key, _ authSource) {
+	enc, err := array.DeleteKeyfile()
+	if err != nil {
+		log.Printf("[AUDIT] Encryption keyfile delete FAILED by key %s: %v", k.Label(), err)
+		writeHTTPError(w, arrayHTTPError(err))
+		return
+	}
+	log.Printf("[AUDIT] Encryption keyfile deleted by key %s", k.Label())
+	writeJSON(w, http.StatusOK, enc)
 }
 
 func (a *Api) handleDisksSpin(w http.ResponseWriter, r *http.Request, k *auth.Key, _ authSource) {

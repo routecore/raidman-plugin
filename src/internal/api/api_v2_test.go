@@ -128,6 +128,9 @@ var v2Cases = []v2Case{
 	{"POST", "/api/docker/updates/check", "", 200, false, false, false},
 	{"GET", "/api/docker/meta", "", 200, true, true, false},
 	{"GET", "/api/disks/state", "", 200, true, false, false},
+	{"GET", "/api/array/encryption", "", 200, true, false, false},
+	// The test disks.ini has no encrypted disk: nothing to delete.
+	{"POST", "/api/array/encryption/keyfile/delete", "", 409, false, false, false},
 	{"POST", "/api/disks/spin", `{"disk":"all","action":"down"}`, 200, false, false, false},
 	{"GET", "/api/mover/status", "", 200, true, false, false},
 	{"POST", "/api/mover/action", `{"action":"start"}`, 200, false, false, false},
@@ -276,10 +279,10 @@ func TestV2ResponseShapes(t *testing.T) {
 	if err := json.Unmarshal(body, &health); err != nil {
 		t.Fatal(err)
 	}
-	if health.Version != "2026.11.18" || health.Protocol != 2 || health.Unraid == nil || *health.Unraid != "7.2.0" || len(health.Features) != 18 || health.HostTerminal == nil {
+	if health.Version != "2026.11.18" || health.Protocol != 2 || health.Unraid == nil || *health.Unraid != "7.2.0" || len(health.Features) != 19 || health.HostTerminal == nil {
 		t.Fatalf("health = %s", body)
 	}
-	for _, f := range []string{"docker.updates", "docker.meta", "disks.state", "disks.spin", "mover", "parity.v2", "power", "terminal.resize", "vm.reset", "vm.ips", "vm.hostdevs", "plugins.list", "plugins.ops", "disks.smart", "disks.smart.disk", "files", "mem.breakdown", "ups.nut"} {
+	for _, f := range []string{"docker.updates", "docker.meta", "disks.state", "disks.spin", "mover", "parity.v2", "power", "terminal.resize", "vm.reset", "vm.ips", "vm.hostdevs", "plugins.list", "plugins.ops", "disks.smart", "disks.smart.disk", "files", "mem.breakdown", "ups.nut", "array.encryption"} {
 		if !strings.Contains(string(body), `"`+f+`"`) {
 			t.Errorf("health missing feature %s", f)
 		}

@@ -66,7 +66,7 @@ A success response is only sent after Unraid accepted the command.
 
 `features`: `docker.updates`, `docker.meta`, `disks.state`, `disks.spin`, `mover`, `parity.v2`, `power`,
 `terminal.resize`, `vm.reset`, `vm.ips`, `vm.hostdevs`, `plugins.list`, `plugins.ops`, `disks.smart`,
-`disks.smart.disk` (SMART requires `DISK:READ_ANY`; older plugins required `ARRAY:READ_ANY`), `files`, `mem.breakdown`, `ups.nut`. `unraid` is `null` if unknown. `hostTerminal` is
+`disks.smart.disk` (SMART requires `DISK:READ_ANY`; older plugins required `ARRAY:READ_ANY`), `files`, `mem.breakdown`, `ups.nut`, `array.encryption`. `unraid` is `null` if unknown. `hostTerminal` is
 `false` when the host terminal is disabled in the plugin settings (the `host` stream then refuses). A 404 means either a protocol-1 plugin or no plugin at all
 (both answer 404 under `/raidman/`); clients tell them apart with the protocol-1 `/connect` probe.
 
@@ -78,6 +78,8 @@ A success response is only sent after Unraid accepted the command.
 | `POST /api/docker/updates/check` | `DOCKER:UPDATE_ANY` | | `{"started":true}` (+ `"alreadyRunning":true` if a check is in progress) |
 | `GET /api/docker/meta` | `DOCKER:READ_ANY` | | `[{"id","name","webUiUrl","iconUrl","shell","support","project","managedBy"}]` |
 | `GET /api/disks/state` | `ARRAY:READ_ANY` | | `[{"name","device","type","spundown","temp","status","rotational"}]` |
+| `GET /api/array/encryption` | `ARRAY:READ_ANY` | | `{"status":"none"\|"new"\|"missing"\|"wrong"\|"present","keyfile":bool}`: the webGUI's Start-array encryption status, from disks.ini and var.ini |
+| `POST /api/array/encryption/keyfile/delete` | `ARRAY:UPDATE_ANY` | | the new `{"status","keyfile":false}`; 409 unless the array is stopped and the saved keyfile is the wrong key (the webGUI's "Delete" of the encryption keyfile) |
 | `POST /api/disks/spin` | `ARRAY:UPDATE_ANY` | `{"disk":"disk1"\|"all","action":"up"\|"down"}` | `{"ok":true}` |
 | `GET /api/mover/status` | `ARRAY:READ_ANY` | | `{"running":false}` |
 | `POST /api/mover/action` | `ARRAY:UPDATE_ANY` | `{"action":"start"\|"stop"}` | `{"ok":true,"running":bool}` |
