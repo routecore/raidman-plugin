@@ -231,9 +231,15 @@ func (a *Api) handleArrayAction(w http.ResponseWriter, r *http.Request, k *auth.
 // the fields the app's list reads; see containerSummary. Other "fields"
 // values are ignored (full documents), so older plugins that do not know the
 // parameter stay compatible with clients that always send it.
+//
+// Sizes are computed with ?size=1, and also for a request with none of
+// fields, summary, size or env: protocol-1 apps (1.2.0) send a bare GET and
+// read SizeRootFs, which protocol-1 plugins always included. Current apps
+// always send fields=summary, so they never pay for it.
 func (a *Api) handleGetContainers(w http.ResponseWriter, r *http.Request, k *auth.Key, _ authSource) {
 	q := r.URL.Query()
-	containers, err := getContainers(r.Context(), docker.ContainerOptions{Size: q.Get("size") == "1"})
+	legacy := !q.Has("fields") && !q.Has("summary") && !q.Has("size") && !q.Has("env")
+	containers, err := getContainers(r.Context(), docker.ContainerOptions{Size: q.Get("size") == "1" || legacy})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

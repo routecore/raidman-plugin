@@ -228,6 +228,8 @@ describes the last published package, because installed servers and Community Ap
 
 1. In a normal pull request, add `<CHANGE>YYYY.MM.DD - what changed</CHANGE>` at the top of `<CHANGES>` in
    `raidman.plg` (the release fails without an entry for its tag) and update `<Date>` in `raidman.xml`.
+   Use the actual release day for the tag, `<CHANGE>` and `<Date>` (not the day the pull request was opened),
+   so CA Auto Update's age delay counts from the release.
    Merge it once CI is green.
 2. Tag the commit on `main` and push the tag: `git tag 2026.12.01 && git push origin 2026.12.01`.
 3. The release job then:

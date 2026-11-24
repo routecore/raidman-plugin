@@ -135,13 +135,18 @@ func TestContainersSummaryMode(t *testing.T) {
 		return []map[string]any{m}, nil
 	}
 
-	// Default: full inspect documents, Env stripped (unchanged contract).
+	// Default: full inspect documents, Env stripped. A bare GET (protocol-1
+	// apps) also gets the sizes, as protocol-1 plugins always sent them.
 	code, body := doReq(t, h, "GET", "/api/docker/containers", "", keyAdmin)
 	var full []map[string]any
 	if err := json.Unmarshal(body, &full); code != 200 || err != nil || len(full) != 1 {
 		t.Fatalf("default: %d %v %q", code, err, body)
 	}
+	if !gotSize.Load() {
+		t.Error("bare GET did not compute sizes")
+	}
 	want := inspectFixture()
+	want["SizeRw"], want["SizeRootFs"] = int64(1), int64(2)
 	docker.StripEnv(want)
 	wantJS, _ := json.Marshal(want)
 	gotJS, _ := json.Marshal(full[0])
@@ -183,6 +188,28 @@ func TestContainersSummaryMode(t *testing.T) {
 	_, body = doReq(t, h, "GET", "/api/docker/containers?fields=bogus", "", keyAdmin)
 	if !strings.Contains(string(body), "GraphDriver") {
 		t.Errorf("fields=bogus should answer full documents: %s", body)
+	}
+
+	// Any of the protocol-2 parameters opts out of the legacy size default;
+	// size=1 always asks for it.
+	for q, want := range map[string]bool{
+		"":                true,
+		"?fields=summary": false,
+		"?summary=1":      false,
+		"?fields=bogus":   false,
+		"?fields=":        false,
+		"?env=1":          false,
+		"?size=0":         false,
+		"?size=1":         true,
+		"?other=1":        true,
+	} {
+		gotSize.Store(!want)
+		if code, body := doReq(t, h, "GET", "/api/docker/containers"+q, "", keyAdmin); code != 200 {
+			t.Fatalf("%q: %d %s", q, code, body)
+		}
+		if gotSize.Load() != want {
+			t.Errorf("%q: Size = %v, want %v", q, !want, want)
+		}
 	}
 }
 

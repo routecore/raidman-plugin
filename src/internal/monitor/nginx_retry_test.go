@@ -155,3 +155,65 @@ func TestRejectedInjectionBacksOffUntilAFileChanges(t *testing.T) {
 		t.Fatal("rejected include was not reverted")
 	}
 }
+
+// On an update the include is already present. A raidman.conf the plg could
+// not reload is reloaded once nginx -t passes, exactly once.
+func TestPendingReloadWithIncludePresent(t *testing.T) {
+	fail := true
+	validate := func() error {
+		if fail {
+			return errors.New("nginx: [emerg] other plugin broke it")
+		}
+		return nil
+	}
+	m, path, reloads := newTestMonitor(t, "location /x {}\n"+RaidmanConfLine+"\n", validate)
+	m.reloadPending = filepath.Join(t.TempDir(), "raidman-nginx-reload")
+
+	m.checkAndInject() // no marker: nothing to do
+	if *reloads != 0 || m.lastPrecheckErr != "" {
+		t.Fatalf("reloaded or validated without a marker: reloads=%d", *reloads)
+	}
+
+	if err := os.WriteFile(m.reloadPending, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.checkAndInject()
+	if *reloads != 0 {
+		t.Fatal("reloaded while nginx -t fails")
+	}
+	if _, err := os.Stat(m.reloadPending); err != nil {
+		t.Fatal("marker removed before the reload happened")
+	}
+
+	fail = false
+	m.checkAndInject()
+	m.checkAndInject()
+	if *reloads != 1 {
+		t.Fatalf("reloads = %d, want 1", *reloads)
+	}
+	if _, err := os.Stat(m.reloadPending); !os.IsNotExist(err) {
+		t.Fatalf("marker not removed after reload: %v", err)
+	}
+	if b, _ := os.ReadFile(path); strings.Count(string(b), RaidmanConfLine) != 1 {
+		t.Fatalf("locations.conf changed: %q", b)
+	}
+}
+
+// A failed reload keeps the marker so the next check retries.
+func TestPendingReloadKeptWhenReloadFails(t *testing.T) {
+	m, _, _ := newTestMonitor(t, RaidmanConfLine+"\n", func() error { return nil })
+	m.reloadPending = filepath.Join(t.TempDir(), "raidman-nginx-reload")
+	if err := os.WriteFile(m.reloadPending, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	attempts := 0
+	m.reload = func() error { attempts++; return errors.New("signal failed") }
+	m.checkAndInject()
+	m.checkAndInject()
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if _, err := os.Stat(m.reloadPending); err != nil {
+		t.Fatal("marker removed although the reload failed")
+	}
+}

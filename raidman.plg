@@ -50,6 +50,9 @@ NGINX=/usr/sbin/nginx
 LOCATIONS=/etc/nginx/conf.d/locations.conf
 NGINX_CONF=/etc/nginx/conf.d/raidman.conf
 INCLUDE_LINE="include /etc/nginx/conf.d/raidman.conf;"
+# Tells the daemon's nginx monitor to reload nginx once nginx -t passes
+# (src/internal/monitor/nginx.go).
+RELOAD_PENDING=/var/run/raidman-nginx-reload
 # Every file the package must contain (scripts/check-package.sh reads this line).
 REQUIRED_FILES="raidman raidman.page raidman.conf rc.raidman icon.png web/novnc/vnc.html"
 
@@ -147,6 +150,12 @@ chmod 0644 /etc/logrotate.d/raidman
 # -------------------------------------------------
 echo "Configuring nginx..."
 if [ ! -f "$LOCATIONS" ] || ! PRECHECK=$($NGINX -t 2>&1); then
+  # No reload here. On an update the include is already present, so the
+  # monitor's injection never reloads either: leave a marker so a changed
+  # snippet is still loaded once nginx -t passes.
+  if [ ! -f "$NGINX_CONF" ] || [ "$(sha256sum < "$TMP/raidman.conf")" != "$(sha256sum < "$NGINX_CONF")" ]; then
+    touch "$RELOAD_PENDING"
+  fi
   install -m 0644 "$TMP/raidman.conf" "$NGINX_CONF"
   if [ ! -f "$LOCATIONS" ]; then
     echo "nginx locations.conf not generated yet; RaidMan will add its include when nginx starts."
@@ -172,7 +181,13 @@ else
 
   if NGINX_TEST=$($NGINX -t 2>&1); then
     if [ -f /var/run/nginx.pid ]; then
-      $NGINX -s reload && echo "nginx reloaded"
+      if $NGINX -s reload; then
+        echo "nginx reloaded"
+        rm -f "$RELOAD_PENDING"
+      else
+        echo "WARNING: nginx reload failed; RaidMan retries once nginx -t passes."
+        touch "$RELOAD_PENDING"
+      fi
     fi
   else
     echo "WARNING: nginx rejected the RaidMan configuration; rolling back:"
@@ -224,7 +239,7 @@ else
   pkill -TERM -x raidman 2>/dev/null
 fi
 rm -f /etc/rc.d/rc.raidman /etc/logrotate.d/raidman
-rm -f /var/run/raidman.pid /var/run/raidman-supervisor.pid /var/run/raidman-supervisor.lock /var/run/raidman.stopped
+rm -f /var/run/raidman.pid /var/run/raidman-supervisor.pid /var/run/raidman-supervisor.lock /var/run/raidman.stopped /var/run/raidman-nginx-reload
 rm -f /var/log/raidman.log /var/log/raidman.log.1 /var/log/raidman-update.log
 
 # Clean up nginx configuration (include first, so nginx never references a

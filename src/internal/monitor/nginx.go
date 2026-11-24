@@ -21,6 +21,9 @@ const (
 	RaidmanConfFile   = "raidman.conf"
 	RaidmanConfLine   = "include /etc/nginx/conf.d/raidman.conf;"
 	NginxBinary       = "/usr/sbin/nginx"
+	// Left by the plg install when it replaced raidman.conf but could not
+	// reload nginx (nginx -t failed for another reason, or the reload failed).
+	ReloadPendingFile = "/var/run/raidman-nginx-reload"
 
 	// rc.nginx regenerates locations.conf in several writes; wait for it to
 	// settle before inspecting it.
@@ -53,6 +56,7 @@ type NginxMonitor struct {
 
 	// Overridable for tests.
 	confDir       string
+	reloadPending string // "" = no marker check
 	validate      func() error
 	reload        func() error
 	retryInterval time.Duration // 0 = defaultRetryInterval
@@ -64,10 +68,11 @@ func NewNginxMonitor() (*NginxMonitor, error) {
 		return nil, err
 	}
 	return &NginxMonitor{
-		watcher:  watcher,
-		confDir:  NginxConfDir,
-		validate: validateNginxConfig,
-		reload:   reloadNginx,
+		watcher:       watcher,
+		confDir:       NginxConfDir,
+		reloadPending: ReloadPendingFile,
+		validate:      validateNginxConfig,
+		reload:        reloadNginx,
 	}, nil
 }
 
@@ -185,6 +190,7 @@ func (m *NginxMonitor) checkAndInject() {
 		return
 	}
 	if bytes.Contains(original, []byte(RaidmanConfLine)) {
+		m.reloadIfPending()
 		return
 	}
 
@@ -246,7 +252,47 @@ func (m *NginxMonitor) checkAndInject() {
 	if err := m.reload(); err != nil {
 		log.Printf("Monitor: Config valid but reload failed: %v", err)
 	} else {
+		m.clearReloadPending()
 		log.Println("Monitor: Nginx reloaded successfully with Raidman config.")
+	}
+}
+
+// reloadIfPending reloads nginx when the plg install replaced raidman.conf
+// without reloading. On an update the include is already present, so the
+// injection path never runs and nginx would otherwise keep serving the old
+// snippet until something else reloads it.
+func (m *NginxMonitor) reloadIfPending() {
+	if m.reloadPending == "" {
+		return
+	}
+	if _, err := os.Stat(m.reloadPending); err != nil {
+		return
+	}
+	if err := m.validate(); err != nil {
+		if msg := err.Error(); msg != m.lastPrecheckErr {
+			m.lastPrecheckErr = msg
+			log.Printf("Monitor: %s changed but nginx config is currently invalid: %v. Reload deferred; retrying every %s.", RaidmanConfFile, err, m.interval())
+		}
+		return
+	}
+	if m.lastPrecheckErr != "" {
+		log.Println("Monitor: Nginx config is valid again.")
+		m.lastPrecheckErr = ""
+	}
+	if err := m.reload(); err != nil {
+		log.Printf("Monitor: Reload for the updated %s failed: %v", RaidmanConfFile, err)
+		return
+	}
+	m.clearReloadPending()
+	log.Printf("Monitor: Nginx reloaded with the updated %s.", RaidmanConfFile)
+}
+
+func (m *NginxMonitor) clearReloadPending() {
+	if m.reloadPending == "" {
+		return
+	}
+	if err := os.Remove(m.reloadPending); err != nil && !os.IsNotExist(err) {
+		log.Printf("Monitor: Could not remove %s: %v", m.reloadPending, err)
 	}
 }
 
