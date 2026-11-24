@@ -33,10 +33,11 @@ type route struct {
 	V2 bool
 	// CookieAuth reports whether this request may authenticate with a
 	// cookie (the app's x-api-key cookie or the raidman_session cookie).
-	// nil means header only. Cookies exist solely for the VNC web view, so
-	// only noVNC assets and the vm-vnc stream accept them; everything else
-	// (host terminal, power, docker exec, ...) needs the x-api-key header,
-	// which a cross-site page cannot set (CSRF).
+	// nil means header only. Cookies exist for the VNC web view, so noVNC
+	// assets and the vm-vnc stream accept them, plus the read-only
+	// array-status and docker-stats streams (see cookieStreams); everything
+	// else (host terminal, power, docker exec, ...) needs the x-api-key
+	// header, which a cross-site page cannot set (CSRF).
 	CookieAuth func(r *http.Request) bool
 }
 
@@ -45,9 +46,17 @@ const maxBodyBytes = 1 << 20
 
 func cookieAlways(*http.Request) bool { return true }
 
-func cookieForVNCStream(r *http.Request) bool {
+// cookieStreams are the /connect types that accept cookie auth. Besides
+// vm-vnc, app 1.2.0 opens array-status and docker-stats without the
+// x-api-key header (it sends ?token=, which no plugin reads). Those only
+// authenticated through the x-api-key cookie its VNC console puts in the
+// shared iOS cookie store, which the old plugin accepted on every stream.
+// Both are read-only, and cookies still need a same-origin Origin.
+var cookieStreams = map[string]bool{"vm-vnc": true, "array-status": true, "docker-stats": true}
+
+func cookieForStream(r *http.Request) bool {
 	t := r.URL.Query()["type"]
-	return len(t) == 1 && t[0] == "vm-vnc"
+	return len(t) == 1 && cookieStreams[t[0]]
 }
 
 func (rt route) errorWriter() errorWriter {
@@ -109,7 +118,7 @@ func (a *Api) routes() []route {
 
 		// WebSocket streams: authentication here, per-type authorization in
 		// handleConnect against wsRoutes().
-		{Path: "/connect", Req: AnyKey(), Handler: a.handleConnect, CookieAuth: cookieForVNCStream},
+		{Path: "/connect", Req: AnyKey(), Handler: a.handleConnect, CookieAuth: cookieForStream},
 
 		// noVNC static assets
 		{Path: "/novnc/", Prefix: true, Preflight: true, Req: AnyKey(), Handler: a.handleNoVNC, CookieAuth: cookieAlways},

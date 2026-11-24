@@ -13,9 +13,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Cookies (the app's raw-key cookie and the raidman_session cookie) exist only
-// for the VNC web view. Every other route and stream must ignore them, so a
-// same-site page cannot drive the host terminal, power or docker exec.
+// Cookies (the app's raw-key cookie and the raidman_session cookie) exist for
+// the VNC web view; app 1.2.0 also relies on them for the read-only
+// array-status and docker-stats streams. Every other route and stream must
+// ignore them, so a same-site page cannot drive the host terminal, power or
+// docker exec.
 func TestCookieAuthOnlyForVNC(t *testing.T) {
 	a, _ := newTestApi(t)
 	h, err := a.Handler()
@@ -56,6 +58,9 @@ func TestCookieAuthOnlyForVNC(t *testing.T) {
 			{http.MethodGet, "/raidman/connect?type=host"},
 			{http.MethodGet, "/raidman/connect?type=docker&container=x"},
 			{http.MethodGet, "/raidman/connect?type=vm-vnc&type=host"},
+			{http.MethodGet, "/raidman/connect?type=array-status&type=host"},
+			{http.MethodGet, "/raidman/connect?type=docker-log&container=x"},
+			{http.MethodGet, "/raidman/connect?type=vm&vm=x"},
 		} {
 			if code := serve(tc.method, tc.path, c); code != http.StatusUnauthorized {
 				t.Errorf("%s cookie on %s %s: got %d, want 401", name, tc.method, tc.path, code)
@@ -66,8 +71,24 @@ func TestCookieAuthOnlyForVNC(t *testing.T) {
 		if code := serve(http.MethodGet, "/raidman/novnc/vnc.html", c); code == http.StatusUnauthorized || code == http.StatusForbidden {
 			t.Errorf("%s cookie rejected on /novnc/: %d", name, code)
 		}
-		if code := serve(http.MethodGet, "/raidman/connect?type=vm-vnc&vm=x", c); code == http.StatusUnauthorized || code == http.StatusForbidden {
-			t.Errorf("%s cookie rejected on vm-vnc: %d", name, code)
+		for _, path := range []string{
+			"/raidman/connect?type=vm-vnc&vm=x",
+			"/raidman/connect?type=array-status",
+			"/raidman/connect?type=docker-stats",
+			"/raidman/connect?type=docker-stats&container=x",
+		} {
+			if code := serve(http.MethodGet, path, c); code == http.StatusUnauthorized || code == http.StatusForbidden {
+				t.Errorf("%s cookie rejected on %s: %d", name, path, code)
+			}
+		}
+		// ...but never from a cross-site page.
+		r := httptest.NewRequest(http.MethodGet, "/raidman/connect?type=docker-stats", nil)
+		r.Header.Set("Origin", "https://evil.example")
+		r.AddCookie(c)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s cookie from a cross-site origin on docker-stats: got %d, want 401", name, rec.Code)
 		}
 	}
 }
