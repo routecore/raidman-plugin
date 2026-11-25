@@ -55,16 +55,18 @@ var cookieUpgrader = websocket.Upgrader{
 	},
 }
 
-// headerUpgrader is used when the key came in the x-api-key header. A browser
-// page cannot set that header on a WebSocket, so the request cannot be forged
-// cross-site and the Origin (which native clients and reverse proxies set
-// inconsistently) is not checked.
+// headerUpgrader is used when the key came in the x-api-key header or as the
+// subprotocol. A cross-site page cannot set that header and does not know the
+// key, so the request cannot be forged cross-site and the Origin (which native
+// clients and reverse proxies set inconsistently) is not checked. No
+// subprotocol is ever echoed back (Subprotocols is unset and Upgrade gets no
+// response header), so the key never appears in a response.
 var headerUpgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
 
 func upgraderFor(src authSource) *websocket.Upgrader {
-	if src == authHeader {
+	if src == authHeader || src == authSubprotocol {
 		return &headerUpgrader
 	}
 	return &cookieUpgrader

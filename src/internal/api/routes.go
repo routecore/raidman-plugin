@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/gorilla/websocket"
 	"github.com/routecore/raidman-plugin/src/internal/service/auth"
 )
 
@@ -39,6 +40,9 @@ type route struct {
 	// else (host terminal, power, docker exec, ...) needs the x-api-key
 	// header, which a cross-site page cannot set (CSRF).
 	CookieAuth func(r *http.Request) bool
+	// SubprotocolAuth lets a WebSocket upgrade carry the key as its
+	// subprotocol (app 1.2.0). Never honoured on plain HTTP requests.
+	SubprotocolAuth bool
 }
 
 // maxBodyBytes bounds every request body (all requests are small JSON).
@@ -118,7 +122,7 @@ func (a *Api) routes() []route {
 
 		// WebSocket streams: authentication here, per-type authorization in
 		// handleConnect against wsRoutes().
-		{Path: "/connect", Req: AnyKey(), Handler: a.handleConnect, CookieAuth: cookieForStream},
+		{Path: "/connect", Req: AnyKey(), Handler: a.handleConnect, CookieAuth: cookieForStream, SubprotocolAuth: true},
 
 		// noVNC static assets
 		{Path: "/novnc/", Prefix: true, Preflight: true, Req: AnyKey(), Handler: a.handleNoVNC, CookieAuth: cookieAlways},
@@ -183,7 +187,8 @@ func (a *Api) wrap(rt route) http.Handler {
 		}
 		errf := rt.errorWriter()
 		allowCookie := rt.CookieAuth != nil && rt.CookieAuth(r)
-		k, src := a.authorize(w, r, rt.Req, allowCookie, errf)
+		allowSubprotocol := rt.SubprotocolAuth && websocket.IsWebSocketUpgrade(r)
+		k, src := a.authorize(w, r, rt.Req, allowCookie, allowSubprotocol, errf)
 		if k == nil {
 			return
 		}

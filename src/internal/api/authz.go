@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,22 +89,35 @@ const (
 	authHeader
 	authKeyCookie
 	authSession
+	// authSubprotocol: the key came as the WebSocket subprotocol
+	// (Sec-WebSocket-Protocol), which is how app 1.2.0 opens its log,
+	// console, terminal and VM log streams. Like the header it is an
+	// explicit secret a cross-site page cannot know, so it is CSRF-safe.
+	authSubprotocol
 )
 
 var errNoCredentials = errors.New("missing API key")
 
 // authenticate resolves the request's credentials to a key.
 //
-// Order: x-api-key header (CSRF-safe), then - only where allowCookie is set
+// Order: x-api-key header (CSRF-safe), then - only on WebSocket upgrades of
+// routes that allow it (allowSubprotocol) - a key-shaped value in
+// Sec-WebSocket-Protocol (also CSRF-safe; never echoed back), then - only where allowCookie is set
 // (noVNC assets and the vm-vnc stream) - the x-api-key cookie set by the
 // app's VNC web view, then the plugin's opaque raidman_session cookie. Cookies
 // are only honoured from a same-origin Origin/Referer (CSRF protection).
 // Session ids map server-side to the key's hash and are re-resolved on every
 // request, so a revoked or rotated key invalidates its sessions immediately.
-func (a *Api) authenticate(r *http.Request, allowCookie bool) (*auth.Key, authSource, error) {
+func (a *Api) authenticate(r *http.Request, allowCookie, allowSubprotocol bool) (*auth.Key, authSource, error) {
 	if v := r.Header.Get("x-api-key"); v != "" {
 		k, err := a.keys.Authenticate(v)
 		return k, authHeader, err
+	}
+	if allowSubprotocol {
+		if v := subprotocolKey(r); v != "" {
+			k, err := a.keys.Authenticate(v)
+			return k, authSubprotocol, err
+		}
 	}
 	if !allowCookie {
 		return nil, authNone, errNoCredentials
@@ -140,7 +154,7 @@ func (a *Api) authenticate(r *http.Request, allowCookie bool) (*auth.Key, authSo
 //
 // errf writes the error body: plain text for protocol-1 routes, the
 // protocol-2 JSON shape { "error": "..." } for new routes.
-func (a *Api) authorize(w http.ResponseWriter, r *http.Request, req Requirement, allowCookie bool, errf errorWriter) (*auth.Key, authSource) {
+func (a *Api) authorize(w http.ResponseWriter, r *http.Request, req Requirement, allowCookie, allowSubprotocol bool, errf errorWriter) (*auth.Key, authSource) {
 	if errf == nil {
 		errf = textError
 	}
@@ -149,7 +163,7 @@ func (a *Api) authorize(w http.ResponseWriter, r *http.Request, req Requirement,
 		errf(w, http.StatusForbidden, "Forbidden")
 		return nil, authNone
 	}
-	k, src, err := a.authenticate(r, allowCookie)
+	k, src, err := a.authenticate(r, allowCookie, allowSubprotocol)
 	if err != nil {
 		if errors.Is(err, auth.ErrKeyNotAllowed) {
 			if securityLog.allow("allowlist:" + k.Label()) {
@@ -243,4 +257,33 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// subprotocolKey returns the first key-shaped value offered in
+// Sec-WebSocket-Protocol, or "". Only one candidate is ever tried. Ordinary
+// subprotocol names (noVNC offers "binary") are not key-shaped, so such
+// requests fall through to cookie authentication unchanged.
+func subprotocolKey(r *http.Request) string {
+	for _, h := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, p := range strings.Split(h, ",") {
+			if p = strings.TrimSpace(p); keyShaped(p) {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// keyShaped reports whether s looks like an API key (Unraid API keys are 64
+// hex characters) rather than a subprotocol name.
+func keyShaped(s string) bool {
+	if len(s) < 32 || len(s) > 256 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+			return false
+		}
+	}
+	return true
 }

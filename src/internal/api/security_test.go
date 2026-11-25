@@ -406,3 +406,112 @@ func TestSessionCookieSecureBehindProxy(t *testing.T) {
 		}
 	}
 }
+
+// App 1.2.0 opens its log, console, terminal and VM log streams with the key
+// as the WebSocket subprotocol. That is accepted on /connect upgrades only,
+// never echoed, still permission-checked, and does not shadow noVNC's
+// "binary" subprotocol.
+func TestSubprotocolKeyAuth(t *testing.T) {
+	if _, err := os.Stat("/var/local/emhttp/var.ini"); err == nil {
+		t.Skip("running on an Unraid host")
+	}
+	a, dir := newTestApi(t)
+	// Real Unraid API keys are 64 hex characters (the fixtures are not).
+	subViewer, subAdmin := strings.Repeat("0a1b", 16), strings.Repeat("9f8e", 16)
+	for name, js := range map[string]string{
+		"subviewer.json": `{"id":"id-subviewer","key":"` + subViewer + `","name":"subviewer","roles":["VIEWER"],"permissions":[]}`,
+		"subadmin.json":  `{"id":"id-subadmin","key":"` + subAdmin + `","name":"subadmin","roles":["ADMIN"],"permissions":[]}`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(js), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.keys.Reload()
+	h, err := a.Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	defer a.Shutdown(t.Context())
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/raidman/connect?type=array-status"
+
+	// A valid key as subprotocol opens the stream, even with a foreign Origin
+	// (an explicit secret, like the header), and is not echoed back.
+	d := websocket.Dialer{Subprotocols: []string{subViewer}}
+	c, resp, err := d.Dial(wsURL, http.Header{"Origin": {"https://evil.example"}})
+	if err != nil {
+		t.Fatalf("subprotocol key: %v (status %v)", err, statusOf(resp))
+	}
+	if p := resp.Header.Get("Sec-WebSocket-Protocol"); p != "" {
+		t.Errorf("subprotocol echoed back: %q", p)
+	}
+	c.Close()
+
+	// An unknown key-shaped value is rejected, not ignored.
+	d = websocket.Dialer{Subprotocols: []string{strings.Repeat("ab", 32)}}
+	if _, resp, err := d.Dial(wsURL, nil); err == nil || statusOf(resp) != http.StatusUnauthorized {
+		t.Errorf("unknown key: err %v status %v, want 401", err, statusOf(resp))
+	}
+
+	serve := func(path string, upgrade bool, hdr map[string]string, cookie *http.Cookie) int {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		if upgrade {
+			r.Header.Set("Connection", "Upgrade")
+			r.Header.Set("Upgrade", "websocket")
+			r.Header.Set("Sec-WebSocket-Version", "13")
+			r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+		}
+		for k, v := range hdr {
+			r.Header.Set(k, v)
+		}
+		if cookie != nil {
+			r.AddCookie(cookie)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec.Code
+	}
+	sub := map[string]string{"Sec-WebSocket-Protocol": subAdmin}
+	// Not an upgrade, or not /connect: the subprotocol is no credential.
+	if code := serve("/raidman/connect?type=array-status", false, sub, nil); code != http.StatusUnauthorized {
+		t.Errorf("plain GET with subprotocol key: %d, want 401", code)
+	}
+	if code := serve("/raidman/api/health", true, sub, nil); code != http.StatusUnauthorized {
+		t.Errorf("REST route with subprotocol key: %d, want 401", code)
+	}
+	// Permissions still apply: a viewer key cannot open the host terminal.
+	if code := serve("/raidman/connect?type=host", true, map[string]string{"Sec-WebSocket-Protocol": subViewer}, nil); code != http.StatusForbidden {
+		t.Errorf("viewer subprotocol on host: %d, want 403", code)
+	}
+	// noVNC: "binary" is not a key and falls through to the cookie.
+	vnc := map[string]string{"Sec-WebSocket-Protocol": "binary", "Origin": "http://example.com"}
+	if code := serve("/raidman/connect?type=vm-vnc&vm=x", true, vnc, &http.Cookie{Name: "x-api-key", Value: keyAdmin}); code == http.StatusUnauthorized || code == http.StatusForbidden {
+		t.Errorf("binary + cookie on vm-vnc: %d, want auth to pass", code)
+	}
+	if code := serve("/raidman/connect?type=vm-vnc&vm=x", true, vnc, nil); code != http.StatusUnauthorized {
+		t.Errorf("binary without cookie: %d, want 401", code)
+	}
+}
+
+func statusOf(resp *http.Response) int {
+	if resp == nil {
+		return 0
+	}
+	return resp.StatusCode
+}
+
+func TestKeyShaped(t *testing.T) {
+	for s, want := range map[string]bool{
+		strings.Repeat("a1", 32): true,
+		"binary":                 false,
+		"base64":                 false,
+		strings.Repeat("a", 31):  false,
+		strings.Repeat("a-", 20): false,
+		strings.Repeat("a", 257): false,
+	} {
+		if got := keyShaped(s); got != want {
+			t.Errorf("keyShaped(%.12q…) = %v, want %v", s, got, want)
+		}
+	}
+}
