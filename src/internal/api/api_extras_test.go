@@ -210,3 +210,30 @@ func TestExtrasResponses(t *testing.T) {
 		t.Errorf("range download: %d %q %v", rec.Code, rec.Body.String(), rec.Header())
 	}
 }
+
+// Service errors keep their machine-readable code (SMART 501
+// smart_unsupported), and an over-long file path is a 400 JSON error that
+// does not echo the path.
+func TestExtrasErrorCodesAndLongPaths(t *testing.T) {
+	share := extrasFixtures(t)
+	a, _ := newTestApi(t)
+	h, _ := a.Handler()
+
+	getSmart = func(context.Context, string) (smart.Report, error) {
+		return smart.Report{}, &httperr.Error{Status: http.StatusNotImplemented, Code: httperr.CodeSmartUnsupported,
+			Msg: "SMART is not available for this device (Unknown USB bridge)"}
+	}
+	code, body := doReq(t, h, "GET", "/api/disks/smart?device=sdf", "", keyAdmin)
+	var e struct{ Error, Code string }
+	if code != http.StatusNotImplemented || json.Unmarshal(body, &e) != nil || e.Code != httperr.CodeSmartUnsupported || e.Error == "" {
+		t.Errorf("unsupported SMART: %d %s, want 501 with code %q", code, body, httperr.CodeSmartUnsupported)
+	}
+
+	long := share + "/" + strings.Repeat("a", 300)
+	for _, ep := range []string{"/api/files/list", "/api/files/download"} {
+		code, body := doReq(t, h, "GET", ep+"?path="+url.QueryEscape(long), "", keyAdmin)
+		if code != http.StatusBadRequest || !json.Valid(body) || strings.Contains(string(body), "aaaa") {
+			t.Errorf("%s with a 300-byte name: %d %s, want a 400 JSON error without the path", ep, code, body)
+		}
+	}
+}

@@ -96,6 +96,7 @@ func (a *Api) streamDockerStats(ws *wsConn, r *http.Request, _ *auth.Key) {
 		id, err := normalizeContainerRef(raw)
 		if err != nil {
 			_ = ws.WriteText("Error: " + err.Error())
+			ws.closeWith(websocket.CloseNormalClosure, err.Error())
 			return
 		}
 		containerID = id
@@ -170,22 +171,34 @@ func (a *Api) streamDockerStats(ws *wsConn, r *http.Request, _ *auth.Key) {
 	}
 }
 
+// getVncPort is a variable for tests (never reaches libvirt there).
+var getVncPort = vm.GetVncPort
+
 func (a *Api) streamVNC(ws *wsConn, r *http.Request, _ *auth.Key) {
+	// fail sends the error text, then a close frame (without it the client
+	// sees 1006, an abnormal drop). Nothing reads the socket yet, so a
+	// drain picks up the peer's close echo; it must not run once the
+	// client -> VNC reader below has started.
+	fail := func(msg, reason string) {
+		_ = ws.WriteText(msg)
+		ws.drain()
+		ws.closeWith(websocket.CloseNormalClosure, reason)
+	}
 	ref := r.URL.Query().Get("vm")
 	if err := validateVMRef(ref); err != nil {
-		_ = ws.WriteText("Error: " + err.Error())
+		fail("Error: "+err.Error(), err.Error())
 		return
 	}
 
-	port, err := vm.GetVncPort(ref)
+	port, err := getVncPort(ref)
 	if err != nil {
-		_ = ws.WriteText("Error finding VNC port: " + err.Error())
+		fail("Error finding VNC port: "+err.Error(), "VNC port not found")
 		return
 	}
 
 	vncConn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 5*time.Second)
 	if err != nil {
-		_ = ws.WriteText("Error connecting to VNC: " + err.Error())
+		fail("Error connecting to VNC: "+err.Error(), "VNC connection failed")
 		return
 	}
 	defer vncConn.Close()

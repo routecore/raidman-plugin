@@ -47,8 +47,13 @@ The file browser is read-only and requires the `ADMIN` role. It covers `/mnt/use
 On the flash drive, these files and everything below these directories are always refused (`403`), whatever the key:
 - `/boot/config/shadow`, `/boot/config/passwd`, `/boot/config/smbpasswd` (password hashes)
 - `/boot/config/ssh`, `/boot/config/ssl`, `/boot/config/wireguard` (private keys)
+- `/boot/config/wireless.cfg` (Wi-Fi password), `/boot/config/secrets.tdb` (Samba's machine secrets)
+- `/boot/config/*.key`, in any case (the license key file)
+- `/boot/config/rclone`, `/boot/config/plugins/rclone/.rclone.conf` (rclone remotes and their tokens)
 - `/boot/config/plugins/dynamix.my.servers` (Unraid API key secrets)
 - `/boot/config/plugins/raidman/settings.json` (this plugin's settings)
+
+Paths with a name longer than 255 bytes or a total length over 4095 bytes are refused (`400`) before anything on disk is touched: Unraid's user-share filesystem can crash on such a name. Errors never repeat the requested path.
 
 The check compares file identity (the resolved target and each of its parent directories), not names, because the flash drive is case-insensitive vfat: `/boot/CONFIG/Shadow` or a symlink to it is refused too. With **Host Terminal Access** disabled, an `ADMIN` key can still browse the shares and the rest of `/boot`, but never these files.
 

@@ -2,6 +2,7 @@ package vm
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -129,6 +130,34 @@ func TestStateName(t *testing.T) {
 	for st, w := range want {
 		if got := stateName(uint8(st)); got != w {
 			t.Errorf("stateName(%d) = %q, want %q", st, got, w)
+		}
+	}
+}
+
+// IsNotFound / IsWrongState classify libvirt's answers for the API's 422
+// and 409; anything else stays a plain failure.
+func TestErrorClassification(t *testing.T) {
+	noDomain := libvirt.Error{Code: uint32(libvirt.ErrNoDomain), Message: "Domain not found: no domain with matching name 'x'"}
+	invalid := libvirt.Error{Code: uint32(libvirt.ErrOperationInvalid), Message: "Requested operation is not valid: domain is not running"}
+	other := libvirt.Error{Code: uint32(libvirt.ErrInternalError), Message: "internal error"}
+	for _, c := range []struct {
+		err             error
+		notFound, state bool
+	}{
+		{noDomain, true, false},
+		{fmt.Errorf("lookup: %w", noDomain), true, false},
+		{invalid, false, true},
+		{fmt.Errorf("wrapped: %w", invalid), false, true},
+		{ErrNotRunning, false, true},
+		{other, false, false},
+		{errors.New("Domain not found"), false, false}, // only libvirt's code counts
+		{nil, false, false},
+	} {
+		if got := IsNotFound(c.err); got != c.notFound {
+			t.Errorf("IsNotFound(%v) = %v", c.err, got)
+		}
+		if got := IsWrongState(c.err); got != c.state {
+			t.Errorf("IsWrongState(%v) = %v", c.err, got)
 		}
 	}
 }

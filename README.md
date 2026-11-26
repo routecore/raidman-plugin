@@ -49,13 +49,16 @@ Remote management plugin for Unraid servers, providing real-time monitoring and 
 ## API (protocol 2)
 
 All routes are served under `/raidman/` by nginx (proxied to `127.0.0.1:9876`) and require the
-`x-api-key` header. Protocol-1 routes keep their request/response shapes and plain-text errors.
+`x-api-key` header. Protocol-1 routes keep their request/response shapes and plain-text errors, except the
+`422` `not_found` answer for an unknown container or VM, which is JSON.
 Protocol-2 routes answer JSON; every error (including 401/403/405) is `{"error": "<message>", "code"?: "<code>"}`.
 
 Status codes: `401` missing/invalid key, `403` key lacks the permission, `405` wrong method,
-`400` invalid request, `422` with `"code":"not_found"` unknown disk/container (a `404` only means the route
+`400` invalid request, `422` with `"code":"not_found"` unknown disk/container/VM (a `404` only means the route
 does not exist, i.e. an older plugin), `409` wrong state (e.g. pausing a parity check
-that is not running), `500` the underlying Unraid command failed, `501` feature not available on this server.
+that is not running, pausing a paused container, starting a running VM), `500` the underlying Unraid command
+failed, `501` feature not available on this server (with `"code":"smart_unsupported"` for a disk that cannot
+report SMART).
 A success response is only sent after Unraid accepted the command.
 
 ### Discovery
@@ -107,14 +110,20 @@ Details:
   RaidMan itself. One plugin operation at a time.
 - **SMART** runs `smartctl -n standby -j -H -A /dev/<device>` (device `^(sd[a-z]{1,2}|nvme\d+n\d+)$`); a
   sleeping disk is never woken (`standby: true`, no attributes). NVMe health-log counters are returned as
-  attributes numbered from 1.
+  attributes numbered from 1. A device that cannot report SMART at all (USB bridge, virtual disk) answers `501`
+  with `"code":"smart_unsupported"`. A temperature of exactly 0 with no attributes (what QEMU disks report)
+  is `null`.
 - **Files** are read-only. Paths are canonicalised (`..` refused, symlinks resolved) and must stay under
   `/mnt/user`, `/mnt/user0`, `/mnt/disk<N>`, `/mnt/cache`, `/mnt/<pool>` (pools from `/boot/config/pools/*.cfg`)
-  or `/boot`; the opened descriptor is checked again. Directories first, at most 5000 entries per page; `mtime` is
+  or `/boot`; the opened descriptor is checked again. A name over 255 bytes or a path over 4095 bytes is refused
+  with `400` before the filesystem is touched (an over-long name crashes Unraid's shfs). Errors never echo the
+  path; a filesystem failure answers `500` with the system's reason only (e.g. `transport endpoint is not
+  connected`). Directories first, at most 5000 entries per page; `mtime` is
   Unix seconds. On `/boot`, `config/shadow`, `config/passwd`, `config/smbpasswd`, `config/ssh`, `config/ssl`,
-  `config/wireguard`, `config/plugins/dynamix.my.servers` and `config/plugins/raidman/settings.json` (and
-  everything below them) are refused with `403`; they are matched by file identity, so case variants and
-  symlinks are refused too.
+  `config/wireguard`, `config/wireless.cfg`, `config/secrets.tdb`, `config/*.key` (license keys, any case),
+  `config/rclone`, `config/plugins/rclone/.rclone.conf`, `config/plugins/dynamix.my.servers` and
+  `config/plugins/raidman/settings.json` (and everything below them) are refused with `403`; they are matched
+  by file identity, so case variants and symlinks are refused too.
 - **Memory**: `/proc/meminfo` (used = total − available, cached = buffers + cache + reclaimable slab), ZFS ARC
   from `/proc/spl/kstat/zfs/arcstats`, VMs = resident memory of the qemu processes, Docker = the `docker`
   cgroup minus inactive file cache. Unknown values are `null`.
@@ -157,8 +166,20 @@ Details:
 
 | Route | Permission | Change |
 |---|---|---|
-| `POST /api/vm/action` | `VMS:UPDATE_ANY` | new action `reset` (feature `vm.reset`); unknown actions → `400`; `reset` on a VM that is not running → `409` |
+| `POST /api/vm/action` | `VMS:UPDATE_ANY` | new action `reset` (feature `vm.reset`); unknown actions → `400`; an action the VM's state does not allow (`reset` or `stop` of a VM that is not running, `start` of a running one, `resume` of one that is not paused) → `409` |
 | `GET /api/vm/info`, `GET /api/vms` | `VMS:READ_ANY` | `interfaces[].ipAddresses` (feature `vm.ips`), `hostdevs[]` (feature `vm.hostdevs`), `detailedState` `blocked` / `shutdown` |
+| `POST /api/vm/autostart` | `VMS:UPDATE_ANY` | `enabled` is required (`400` without it; older plugins turned autostart off) |
+
+An unknown VM on `/api/vm/action`, `/api/vm/autostart` or `/api/vm/info` answers `422` `{"error","code":"not_found"}`
+(older plugins: plain-text `500`). `409` bodies stay plain text (libvirt's message).
+
+### Docker actions (protocol-1 route)
+
+`POST /api/docker/action` answers an unknown container with `422` `{"error","code":"not_found"}`, an unknown action
+with `400`, and an action the container's state does not allow (pause a paused container, unpause a running one,
+kill or pause a stopped one) with a plain-text `409` and a short message without the container id
+(`container is already paused`, `container is not paused`, `container is not running`, ...). Older plugins
+answered these with `500` and the daemon's text.
 
 - **reset** is a hard reset (`virDomainReset`, like the reset button; the guest is not asked). Allowed while
   the VM is running, idle (`blocked`) or paused. Only if the hypervisor reports reset as unsupported and the VM
@@ -196,6 +217,17 @@ Details:
 | `host` | `ADMIN` (and enabled in settings) | |
 
 Container ids may be raw Docker ids, names, or Unraid API PrefixedIDs (`<serverId>:<id>`).
+
+Invalid parameters (any stream), an unknown container on `docker-stats`, an unknown VM on `vm` and `vm-log`, and
+every `vm-vnc` error (unknown VM, VM not running) send one text frame starting with `Error` and then close with
+`1000`. `vm-log` refuses a VM that libvirt does not know only when it also has no log file; the log of a deleted
+VM is still served. (`docker`/`docker-log` on a missing or stopped container send the docker CLI's message and
+close with `1000` `process exited (1)`.)
+
+Terminals start at 80x24 until the client sends its size. Closing a container console (`docker`), or losing
+its connection, ends what it ran in the container: the session's processes carry a random
+`RAIDMAN_EXEC=<tag>` variable, are hung up, and are killed if still running after 3 s. Older plugins only
+stopped the `docker exec` client, which left the shell and its children running in the container.
 
 **Terminal resize** (`host`, `docker`, `vm`): send a *text* frame that is exactly either
 `\x1b[8;<rows>;<cols>t` or the JSON object `{"type":"resize","cols":N,"rows":M}` (1–1000). Any other frame

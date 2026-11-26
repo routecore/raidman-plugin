@@ -14,7 +14,6 @@ import (
 
 	"github.com/routecore/raidman-plugin/src/internal/service/auth"
 	"github.com/routecore/raidman-plugin/src/internal/service/files"
-	"github.com/routecore/raidman-plugin/src/internal/service/httperr"
 	"github.com/routecore/raidman-plugin/src/internal/service/memory"
 	"github.com/routecore/raidman-plugin/src/internal/service/nut"
 	"github.com/routecore/raidman-plugin/src/internal/service/plugins"
@@ -40,8 +39,10 @@ var (
 
 const nutTimeout = 30 * time.Second
 
+// writeServiceError answers a service error as JSON, keeping its "code"
+// (e.g. 501 smart_unsupported, 422 not_found).
 func writeServiceError(w http.ResponseWriter, err error) {
-	writeJSONError(w, httperr.StatusOf(err), err.Error())
+	writeHTTPError(w, err)
 }
 
 // opResponse is { ok, output }; a failed operation also carries the output

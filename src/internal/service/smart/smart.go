@@ -228,6 +228,11 @@ func Parse(device string, stdout []byte, exitCode int) (Report, error) {
 		}
 		rep.Attributes = append(rep.Attributes, attrs...)
 	}
+	// Virtual disks (QEMU SCSI/ATA) report a temperature of exactly 0 and
+	// no attributes; a real disk never does both, so that is "unknown".
+	if rep.Temperature != nil && *rep.Temperature == 0 && len(rep.Attributes) == 0 {
+		rep.Temperature = nil
+	}
 	return rep, nil
 }
 

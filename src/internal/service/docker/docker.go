@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -77,6 +78,54 @@ var ErrNotFound = errors.New("container not found")
 
 // ErrInvalidAction is returned for an unknown container action (HTTP 400).
 var ErrInvalidAction = errors.New("invalid action")
+
+// ErrWrongState is returned (wrapped, see stateError) when the container's
+// state does not allow the action: pausing a paused container, unpausing a
+// running one, killing or pausing a stopped one (HTTP 409).
+var ErrWrongState = errors.New("container state does not allow this action")
+
+// stateError is a wrong-state error with a short, fixed message: the
+// daemon's own text carries the full container id ("container 29f44a...
+// is already paused"), which clients should not have to show.
+type stateError struct {
+	msg   string
+	cause error
+}
+
+func (e *stateError) Error() string   { return e.msg }
+func (e *stateError) Unwrap() []error { return []error{ErrWrongState, e.cause} }
+
+// stateMessages maps daemon wording (lower-cased) to the short message.
+var stateMessages = []struct{ daemon, msg string }{
+	{"already paused", "container is already paused"},
+	{"is not paused", "container is not paused"},
+	{"is paused", "container is paused"},
+	{"is not running", "container is not running"},
+	{"is restarting", "container is restarting"},
+	{"marked for removal", "container is being removed"},
+}
+
+// daemonStateRe is the daemon's own wrong-state sentence ("container
+// <64-hex id> is already paused"), recognised even when the error is not
+// classified as a conflict.
+var daemonStateRe = regexp.MustCompile(`(?i)\bcontainer [0-9a-f]{12,64} is (already paused|not paused|paused|not running|restarting)\b`)
+
+// wrapState turns the daemon's wrong-state answers into a stateError. The
+// daemon sends them as 409 Conflict (errdefs.Conflict); daemonStateRe is
+// only a fallback for one that classifies them differently, narrow enough
+// that a genuine failure is never reported as a state conflict.
+func wrapState(err error) error {
+	if err == nil || (!cerrdefs.IsConflict(err) && !daemonStateRe.MatchString(err.Error())) {
+		return err
+	}
+	lower := strings.ToLower(err.Error())
+	for _, m := range stateMessages {
+		if strings.Contains(lower, m.daemon) {
+			return &stateError{msg: m.msg, cause: err}
+		}
+	}
+	return &stateError{msg: ErrWrongState.Error(), cause: err}
+}
 
 var (
 	cliMu  sync.Mutex
@@ -188,6 +237,9 @@ func ExecuteContainerAction(ctx context.Context, containerID string, action stri
 		return fmt.Errorf("%w: %s", ErrInvalidAction, action)
 	}
 	invalidateAll()
+	if err != nil && !cerrdefs.IsNotFound(err) {
+		return wrapState(err)
+	}
 	return wrapNotFound(err)
 }
 

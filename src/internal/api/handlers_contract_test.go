@@ -67,6 +67,15 @@ func TestMissingResourceIsNot404(t *testing.T) {
 		t.Errorf("invalid action: %d %q", code, body)
 	}
 
+	// A wrong state (pause twice, kill a stopped container) is a plain-text
+	// 409 with the service's short message.
+	executeContainerAction = func(context.Context, string, string) error {
+		return fmt.Errorf("%w", docker.ErrWrongState)
+	}
+	if code, body := doReq(t, h, "POST", "/api/docker/action", `{"container":"abc","action":"pause"}`, keyAdmin); code != http.StatusConflict || json.Valid(body) || !strings.Contains(string(body), docker.ErrWrongState.Error()) {
+		t.Errorf("wrong state: %d %q, want plain-text 409", code, body)
+	}
+
 	// Unknown routes stay 404 (that is what "plugin outdated" means).
 	if code, _ := doReq(t, h, "GET", "/api/no/such/route", "", keyAdmin); code != http.StatusNotFound {
 		t.Errorf("unknown route: %d, want 404", code)

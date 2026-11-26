@@ -25,7 +25,11 @@ import (
 	"github.com/routecore/raidman-plugin/src/internal/service/vm"
 )
 
-const qemuLogDir = "/var/log/libvirt/qemu"
+// Overridable in tests.
+var (
+	qemuLogDir    = "/var/log/libvirt/qemu"
+	resolveDomain = vm.ResolveDomain
+)
 
 // ptyStream returns the handler for a PTY-backed stream type.
 func ptyStream(termType string) func(a *Api, ws *wsConn, r *http.Request, k *auth.Key) {
@@ -37,27 +41,27 @@ func ptyStream(termType string) func(a *Api, ws *wsConn, r *http.Request, k *aut
 // buildPtyCommand validates the request and builds the command for a PTY
 // stream. User-supplied values only ever appear as single argv entries after
 // validation (and after "--" where the tool supports it); nothing goes
-// through a shell.
-func (a *Api) buildPtyCommand(termType string, r *http.Request) (*exec.Cmd, string) {
+// through a shell. onEnd, when not nil, runs once the session has ended.
+func (a *Api) buildPtyCommand(termType string, r *http.Request) (cmd *exec.Cmd, errMsg string, onEnd func()) {
 	q := r.URL.Query()
 	termEnv := append(os.Environ(), "TERM=xterm-256color")
 	switch termType {
 	case "host":
 		if !a.hostTerminalEnabled() {
 			log.Printf("[SECURITY] Host terminal disabled by settings")
-			return nil, errHostTerminalDisabled
+			return nil, errHostTerminalDisabled, nil
 		}
 		cmd := exec.Command("/bin/bash", "--login")
 		cmd.Env = termEnv
 		if home := os.Getenv("HOME"); home != "" {
 			cmd.Dir = home
 		}
-		return cmd, ""
+		return cmd, "", nil
 
 	case "docker", "docker-log":
 		id, err := normalizeContainerRef(q.Get("container"))
 		if err != nil {
-			return nil, "Error: " + err.Error()
+			return nil, "Error: " + err.Error(), nil
 		}
 		if termType == "docker" {
 			// Optional shell= (contract §4): allowlisted, default sh.
@@ -65,46 +69,63 @@ func (a *Api) buildPtyCommand(termType string, r *http.Request) (*exec.Cmd, stri
 			if v := q.Get("shell"); v != "" {
 				s, ok := docker.NormalizeShell(v)
 				if !ok {
-					return nil, "Error: unsupported shell (allowed: " + strings.Join(docker.ExecShells, ", ") + ")"
+					return nil, "Error: unsupported shell (allowed: " + strings.Join(docker.ExecShells, ", ") + ")", nil
 				}
 				shell = s
 			}
-			cmd := exec.Command("docker", "exec", "-it", "--", id, shell)
+			// The tag marks the processes started in the container (see
+			// endExecSession); it is passed to the container only, never
+			// set in the docker CLI's own environment.
+			tag, err := newExecTag()
+			if err != nil {
+				return nil, "Error: " + err.Error(), nil
+			}
+			cmd := exec.Command("docker", "exec", "-it", "-e", execTagEnv+"="+tag, "--", id, shell)
 			cmd.Env = termEnv
-			return cmd, ""
+			return cmd, "", func() { endExecSession(tag) }
 		}
-		return exec.Command("docker", "logs", "-f", "--tail", "100", "--", id), ""
+		return exec.Command("docker", "logs", "-f", "--tail", "100", "--", id), "", nil
 
 	case "vm": // serial console
 		ref := q.Get("vm")
 		if err := validateVMRef(ref); err != nil {
-			return nil, "Error: " + err.Error()
+			return nil, "Error: " + err.Error(), nil
 		}
-		dom, err := vm.ResolveDomain(ref)
+		dom, err := resolveDomain(ref)
 		if err != nil {
-			return nil, "Error: VM not found: " + err.Error()
+			return nil, "Error: VM not found: " + err.Error(), nil
 		}
 		// The UUID can never be mistaken for an option and needs no quoting.
 		cmd := exec.Command("virsh", "console", dom.UUID)
 		cmd.Env = termEnv
-		return cmd, ""
+		return cmd, "", nil
 
 	case "vm-log":
 		ref := q.Get("vm")
 		if err := validateVMRef(ref); err != nil {
-			return nil, "Error: " + err.Error()
+			return nil, "Error: " + err.Error(), nil
 		}
+		// The log of a VM libvirt no longer knows (deleted, renamed) can
+		// still be read by name; only when there is neither a domain nor a
+		// log is the stream refused, without the host path, instead of
+		// leaving tail -F waiting for a file that never appears.
 		name := ref
-		if dom, err := vm.ResolveDomain(ref); err == nil {
+		dom, derr := resolveDomain(ref)
+		if derr == nil {
 			name = dom.Name
 		}
 		logPath, ok := vmLogPath(name)
 		if !ok {
-			return nil, "Error: invalid vm name"
+			return nil, "Error: invalid vm name", nil
 		}
-		return exec.Command("tail", "-F", "-n", "100", "--", logPath), ""
+		if derr != nil {
+			if _, err := os.Stat(logPath); err != nil {
+				return nil, "Error: VM not found", nil
+			}
+		}
+		return exec.Command("tail", "-F", "-n", "100", "--", logPath), "", nil
 	}
-	return nil, "Error: unknown type"
+	return nil, "Error: unknown type", nil
 }
 
 // vmLogPath builds the libvirt QEMU log path for a domain name and verifies it
@@ -129,7 +150,7 @@ const errHostTerminalDisabled = "Error: Host terminal access is disabled by admi
 const hangupGrace = 3 * time.Second
 
 func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Key) {
-	cmd, errMsg := a.buildPtyCommand(termType, r)
+	cmd, errMsg, onEnd := a.buildPtyCommand(termType, r)
 	if cmd == nil {
 		_ = ws.WriteText(errMsg)
 		// Nothing else reads this socket; drain it so the peer's close
@@ -145,8 +166,11 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 	log.Printf("[AUDIT] Starting PTY session %q by key %s from %q", termType, k.Label(), truncate(clientIP(r), 64))
 
 	// pty.Start runs the child with Setsid, so it leads its own process
-	// group and the whole group can be signalled on close.
-	ptmx, err := pty.Start(cmd)
+	// group and the whole group can be signalled on close. The terminal
+	// starts at 80x24 (not 0x0) until the client sends its size: docker
+	// exec copies the size at start, and full-screen programs started
+	// before the first resize would otherwise misrender.
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: defaultCols, Rows: defaultRows})
 	if err != nil {
 		_ = ws.WriteText("Error starting pty: " + err.Error())
 		ws.drain()
@@ -165,6 +189,12 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 		close(stop)
 		watcher.Wait()
 		_ = master.Close()
+		// End what the session started inside the container first: the
+		// docker CLI then exits on its own, and killing the CLI alone
+		// would leave the container's processes running.
+		if onEnd != nil {
+			onEnd()
+		}
 		terminateGroup(cmd)
 		log.Printf("[AUDIT] PTY session %q by key %s ended", termType, k.Label())
 		// The process ended on its own (exit, logs of a stopped
@@ -297,8 +327,13 @@ func pollableMaster(ptmx *os.File) *os.File {
 	return os.NewFile(uintptr(nfd), ptmx.Name())
 }
 
-// Terminal size bounds for resize requests.
-const maxTermDim = 1000
+// Terminal size bounds for resize requests, and the size a terminal starts
+// with.
+const (
+	maxTermDim  = 1000
+	defaultCols = 80
+	defaultRows = 24
+)
 
 // resizeEscRe is the xterm window-size report "CSI 8 ; rows ; cols t".
 var resizeEscRe = regexp.MustCompile(`^\x1b\[8;(\d{1,5});(\d{1,5})t$`)

@@ -152,6 +152,20 @@ func lookupDomain(l *libvirt.Libvirt, ref string) (libvirt.Domain, error) {
 // ErrNotRunning is returned when a VM must be running for an operation.
 var ErrNotRunning = errors.New("VM is not running")
 
+// IsNotFound reports libvirt's "Domain not found" (an unknown name or UUID).
+func IsNotFound(err error) bool { return libvirt.IsNotFound(err) }
+
+// IsWrongState reports an action the VM's current state does not allow:
+// ErrNotRunning, or libvirt's "Requested operation is not valid" (starting a
+// running VM, stopping or resuming one that is not running or not paused).
+func IsWrongState(err error) bool {
+	if errors.Is(err, ErrNotRunning) {
+		return true
+	}
+	var le libvirt.Error
+	return errors.As(err, &le) && libvirt.ErrorNumber(le.Code) == libvirt.ErrOperationInvalid
+}
+
 // Domain identifies a resolved VM.
 type Domain struct {
 	Name string

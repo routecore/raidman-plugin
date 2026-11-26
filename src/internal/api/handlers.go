@@ -17,8 +17,32 @@ import (
 	"github.com/routecore/raidman-plugin/src/internal/service/vm"
 )
 
-// executeVmAction is a variable for tests (never reaches libvirt there).
-var executeVmAction = vm.ExecuteVmAction
+// VM operations; variables for tests (never reach libvirt there).
+var (
+	executeVmAction = vm.ExecuteVmAction
+	getVmInfo       = vm.GetVmInfo
+	setVmAutostart  = vm.SetVmAutostart
+)
+
+// vmNotFound answers an unknown VM like an unknown container: 422 with
+// "code":"not_found" as JSON (a 404 tells the app "plugin outdated"). It
+// reports whether err was one.
+func vmNotFound(w http.ResponseWriter, err error) bool {
+	if !vm.IsNotFound(err) {
+		return false
+	}
+	writeHTTPError(w, httperr.NotFound("%s", err.Error()))
+	return true
+}
+
+// vmErrorStatus is the plain-text status of any other VM error: 409 when
+// the VM's state does not allow the operation, else 500.
+func vmErrorStatus(err error) int {
+	if vm.IsWrongState(err) {
+		return http.StatusConflict
+	}
+	return http.StatusInternalServerError
+}
 
 // vmIconDir is a variable for tests.
 var vmIconDir = "/usr/local/emhttp/plugins/dynamix.vm.manager/templates/images"
@@ -84,9 +108,11 @@ func (a *Api) handleVmInfo(w http.ResponseWriter, r *http.Request, _ *auth.Key, 
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	info, err := vm.GetVmInfo(ref)
+	info, err := getVmInfo(ref)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if !vmNotFound(w, err) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, info)
@@ -103,8 +129,10 @@ func (a *Api) handleGetVms(w http.ResponseWriter, _ *http.Request, _ *auth.Key, 
 
 func (a *Api) handleVmAutostart(w http.ResponseWriter, r *http.Request, k *auth.Key, _ authSource) {
 	var req struct {
-		Vm      string `json:"vm"`
-		Enabled bool   `json:"enabled"`
+		Vm string `json:"vm"`
+		// A pointer: a request without "enabled" must not silently turn
+		// autostart off.
+		Enabled *bool `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -114,15 +142,22 @@ func (a *Api) handleVmAutostart(w http.ResponseWriter, r *http.Request, k *auth.
 		http.Error(w, "Missing vm name", http.StatusBadRequest)
 		return
 	}
+	if req.Enabled == nil {
+		http.Error(w, "Missing enabled", http.StatusBadRequest)
+		return
+	}
 	if err := validateVMRef(req.Vm); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := vm.SetVmAutostart(req.Vm, req.Enabled); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := setVmAutostart(req.Vm, *req.Enabled); err != nil {
+		log.Printf("[AUDIT] VM autostart=%v on %q FAILED by key %s: %v", *req.Enabled, req.Vm, k.Label(), err)
+		if !vmNotFound(w, err) {
+			http.Error(w, err.Error(), vmErrorStatus(err))
+		}
 		return
 	}
-	log.Printf("[AUDIT] VM autostart=%v on %q by key %s", req.Enabled, req.Vm, k.Label())
+	log.Printf("[AUDIT] VM autostart=%v on %q by key %s", *req.Enabled, req.Vm, k.Label())
 	writeSuccess(w)
 }
 
@@ -149,11 +184,9 @@ func (a *Api) handleVmAction(w http.ResponseWriter, r *http.Request, k *auth.Key
 	}
 	if err := executeVmAction(req.Vm, req.Action); err != nil {
 		log.Printf("[AUDIT] VM action %q on %q FAILED by key %s: %v", req.Action, req.Vm, k.Label(), err)
-		status := http.StatusInternalServerError
-		if errors.Is(err, vm.ErrNotRunning) {
-			status = http.StatusConflict
+		if !vmNotFound(w, err) {
+			http.Error(w, err.Error(), vmErrorStatus(err))
 		}
-		http.Error(w, err.Error(), status)
 		return
 	}
 	log.Printf("[AUDIT] VM action %q on %q by key %s", req.Action, req.Vm, k.Label())
@@ -295,8 +328,14 @@ func (a *Api) handleContainerAction(w http.ResponseWriter, r *http.Request, k *a
 			return
 		}
 		status := http.StatusInternalServerError
-		if errors.Is(err, docker.ErrInvalidAction) {
+		switch {
+		case errors.Is(err, docker.ErrInvalidAction):
 			status = http.StatusBadRequest
+		case errors.Is(err, docker.ErrWrongState):
+			// A double tap (pause twice, kill a stopped container) is not
+			// a server failure. Plain text like every protocol-1 error; the
+			// message is short and carries no container id.
+			status = http.StatusConflict
 		}
 		http.Error(w, err.Error(), status)
 		return

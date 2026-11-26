@@ -162,3 +162,35 @@ func TestParseUnsupported(t *testing.T) {
 		t.Fatal("open failure must not be unsupported")
 	}
 }
+
+// A QEMU disk reports temperature 0 and no attributes: that is "unknown"
+// (null), not 0 °C. Only that exact combination is changed.
+func TestParseVirtualDiskTemperature(t *testing.T) {
+	r, err := Parse("sdb", fixture(t, "qemu.json"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Temperature != nil || r.Passed == nil || !*r.Passed || len(r.Attributes) != 0 {
+		t.Fatalf("QEMU report = %+v (temperature %v), want temperature null", r, r.Temperature)
+	}
+	b, _ := json.Marshal(r)
+	if !strings.Contains(string(b), `"temperature":null`) {
+		t.Errorf("JSON = %s", b)
+	}
+
+	// Nonzero without attributes: kept.
+	warm := strings.Replace(string(fixture(t, "qemu.json")), `"current": 0`, `"current": 35`, 1)
+	if r, err := Parse("sdb", []byte(warm), 0); err != nil || r.Temperature == nil || *r.Temperature != 35 {
+		t.Errorf("35 °C without attributes = %+v, %v", r, err)
+	}
+	// Zero with attributes: kept (a real reading, however odd).
+	var doc map[string]any
+	if err := json.Unmarshal(fixture(t, "ata.json"), &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc["temperature"] = map[string]any{"current": 0}
+	cold, _ := json.Marshal(doc)
+	if r, err := Parse("sdb", cold, 0); err != nil || r.Temperature == nil || *r.Temperature != 0 || len(r.Attributes) == 0 {
+		t.Errorf("0 °C with attributes = %+v, %v", r, err)
+	}
+}

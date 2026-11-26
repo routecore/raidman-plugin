@@ -45,12 +45,18 @@ var (
 	MaxScan = 200000
 	// readChunk is how many entries are read from a directory at a time.
 	readChunk = 1024
+	// evalSymlinks resolves client paths and the configured bases (a hook
+	// for tests).
+	evalSymlinks = filepath.EvalSymlinks
 )
 
 // deniedBoot lists files and directories (relative to BootDir) that are never
 // listed or served, nor anything below them: password hashes, SSH/SSL/
-// WireGuard private keys, the Unraid API key secrets and the plugin's own
-// settings.
+// WireGuard private keys, the Wi-Fi password (wireless.cfg), Samba's machine
+// secrets (secrets.tdb), rclone remotes and their tokens (config/rclone, and
+// the rclone plugin's config), the Unraid API key secrets and the plugin's
+// own settings. The license key files (config/*.key) are added by
+// loadDenied, since their names vary (Basic.key, Pro.key, Starter.key ...).
 var deniedBoot = []string{
 	"config/shadow",
 	"config/passwd",
@@ -58,9 +64,26 @@ var deniedBoot = []string{
 	"config/ssh",
 	"config/ssl",
 	"config/wireguard",
+	"config/wireless.cfg",
+	"config/secrets.tdb",
+	"config/rclone",
+	"config/plugins/rclone/.rclone.conf",
 	"config/plugins/dynamix.my.servers",
 	"config/plugins/raidman/settings.json",
 }
+
+// deniedBootKeyDir holds the license key files (*.key, any case: the flash is
+// vfat, so PRO.KEY is as valid as Pro.key), relative to BootDir.
+const deniedBootKeyDir = "config"
+
+// Path length limits (Linux NAME_MAX and PATH_MAX without the NUL). A longer
+// path is refused before anything touches the filesystem: Unraid's user
+// share filesystem (shfs, FUSE) crashes on an over-long name ("strcpy_share_path
+// ... path too long") and takes /mnt/user down until the array is restarted.
+const (
+	maxNameLen = 255
+	maxPathLen = 4095
+)
 
 var (
 	diskRe     = regexp.MustCompile(`^disk[0-9]+$`)
@@ -75,7 +98,45 @@ var (
 	errSensitive = &httperr.Error{Status: http.StatusForbidden, Msg: "path not allowed: sensitive file"}
 	// 422, not 404: the app reads a plugin 404 as "route missing (old plugin)".
 	errNotFound = &httperr.Error{Status: http.StatusUnprocessableEntity, Msg: "path not found"}
+	errTooLong  = &httperr.Error{Status: http.StatusBadRequest, Msg: "path too long"}
 )
+
+// fsError turns a filesystem error into a client error. The raw error is
+// never sent: it carries the full path (which may be kilobytes of client
+// input) and a Go operation name. Only the errno text is kept as the reason
+// (e.g. "transport endpoint is not connected" when shfs is down).
+func fsError(err error) error {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return errNotFound
+	case errors.Is(err, fs.ErrPermission):
+		return errForbidden
+	case errors.Is(err, syscall.ENAMETOOLONG):
+		return errTooLong
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	}
+	reason := "I/O error"
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		reason = errno.Error()
+	}
+	return &httperr.Error{Status: http.StatusInternalServerError, Msg: "cannot access path: " + reason}
+}
+
+// checkLength refuses a path, or one of its components, longer than the
+// kernel allows (see maxNameLen).
+func checkLength(raw string) error {
+	if len(raw) > maxPathLen {
+		return errTooLong
+	}
+	for _, seg := range strings.Split(raw, "/") {
+		if len(seg) > maxNameLen {
+			return errTooLong
+		}
+	}
+	return nil
+}
 
 // Entry is one directory entry. Mtime is Unix epoch seconds.
 type Entry struct {
@@ -132,7 +193,7 @@ func pools() map[string]bool {
 // bases returns the configured mount bases and their symlink-resolved forms.
 func bases(dir string) []string {
 	out := []string{filepath.Clean(dir)}
-	if r, err := filepath.EvalSymlinks(dir); err == nil && r != out[0] {
+	if r, err := evalSymlinks(dir); err == nil && r != out[0] {
 		out = append(out, r)
 	}
 	return out
@@ -179,6 +240,18 @@ func loadDenied() denySet {
 			d = append(d, fi)
 		}
 	}
+	// License key files: matched by suffix ignoring case, then by identity
+	// like every other entry.
+	keyDir := filepath.Join(BootDir, deniedBootKeyDir)
+	if des, err := os.ReadDir(keyDir); err == nil {
+		for _, de := range des {
+			if n := de.Name(); strings.HasSuffix(strings.ToLower(n), ".key") {
+				if fi, err := os.Stat(filepath.Join(keyDir, n)); err == nil {
+					d = append(d, fi)
+				}
+			}
+		}
+	}
 	return d
 }
 
@@ -213,15 +286,19 @@ func (d denySet) covers(p string, self fs.FileInfo) bool {
 }
 
 // Resolve validates a client path and returns its canonical form (all
-// symlinks resolved). 400: empty, relative or NUL; 403: ".." segments,
-// outside the roots (before or after resolving) or a denied /boot path;
-// 422: missing.
+// symlinks resolved). 400: empty, relative, NUL or too long; 403: ".."
+// segments, outside the roots (before or after resolving) or a denied /boot
+// path; 422: missing. Errors never echo the path.
 func Resolve(raw string) (string, error) {
 	if raw == "" {
 		return "", httperr.New(http.StatusBadRequest, "path missing")
 	}
 	if strings.ContainsRune(raw, 0) || !strings.HasPrefix(raw, "/") {
 		return "", httperr.New(http.StatusBadRequest, "invalid path")
+	}
+	// Before any filesystem call (see maxNameLen).
+	if err := checkLength(raw); err != nil {
+		return "", err
 	}
 	for _, seg := range strings.Split(raw, "/") {
 		if seg == ".." {
@@ -233,15 +310,9 @@ func Resolve(raw string) (string, error) {
 	if rootOf(clean, poolSet) == "" {
 		return "", errForbidden
 	}
-	resolved, err := filepath.EvalSymlinks(clean)
+	resolved, err := evalSymlinks(clean)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return "", errNotFound
-		}
-		if errors.Is(err, fs.ErrPermission) {
-			return "", errForbidden
-		}
-		return "", err
+		return "", fsError(err)
 	}
 	if rootOf(resolved, poolSet) == "" {
 		return "", errForbidden
@@ -315,7 +386,7 @@ func ListContext(ctx context.Context, raw string, opt ListOptions) (Listing, err
 		return Listing{}, err
 	}
 	if fi, err := os.Stat(p); err != nil {
-		return Listing{}, errNotFound
+		return Listing{}, fsError(err)
 	} else if !fi.IsDir() {
 		return Listing{}, httperr.New(http.StatusBadRequest, "not a directory")
 	}
@@ -365,10 +436,7 @@ func ListContext(ctx context.Context, raw string, opt ListOptions) (Listing, err
 		}
 		if err != nil {
 			if total == 0 {
-				if errors.Is(err, fs.ErrPermission) {
-					return Listing{}, errForbidden
-				}
-				return Listing{}, err
+				return Listing{}, fsError(err)
 			}
 			incomplete = true // keep what was read
 			break
@@ -417,7 +485,7 @@ func ListContext(ctx context.Context, raw string, opt ListOptions) (Listing, err
 		case "symlink":
 			// Size of the target only when the target is itself allowed
 			// (never stat outside the roots or a denied path).
-			if target, err := filepath.EvalSymlinks(full); err == nil && rootOf(target, poolSet) != "" {
+			if target, err := evalSymlinks(full); err == nil && rootOf(target, poolSet) != "" {
 				if !deniedLoaded {
 					denied, deniedLoaded = loadDenied(), true
 				}
@@ -448,7 +516,7 @@ func Open(raw string) (*os.File, fs.FileInfo, error) {
 	}
 	fi, err := os.Stat(p)
 	if err != nil {
-		return nil, nil, errNotFound
+		return nil, nil, fsError(err)
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, nil, httperr.New(http.StatusBadRequest, "not a file")

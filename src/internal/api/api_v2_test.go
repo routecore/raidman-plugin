@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -378,17 +379,36 @@ func TestParseResize(t *testing.T) {
 	}
 }
 
+var execTagRe = regexp.MustCompile(`^RAIDMAN_EXEC=[0-9a-f]{32}$`)
+
 func TestDockerExecShellParam(t *testing.T) {
 	a, _ := newTestApi(t)
+	tags := map[string]bool{}
 	build := func(q string) ([]string, string) {
 		r := httptest.NewRequest("GET", "/connect?type=docker&"+q, nil)
-		cmd, msg := a.buildPtyCommand("docker", r)
+		cmd, msg, onEnd := a.buildPtyCommand("docker", r)
 		if cmd == nil {
+			if onEnd != nil {
+				t.Errorf("%s: refused session has a cleanup", q)
+			}
 			return nil, msg
 		}
-		return cmd.Args, ""
+		// Every session gets its own tag, given to the container only.
+		args := append([]string(nil), cmd.Args...)
+		if len(args) < 5 || args[3] != "-e" || !execTagRe.MatchString(args[4]) || tags[args[4]] || onEnd == nil {
+			t.Errorf("%s: no fresh session tag: %q", q, args)
+			return args, ""
+		}
+		tags[args[4]] = true
+		for _, e := range cmd.Env {
+			if strings.HasPrefix(e, execTagEnv+"=") {
+				t.Errorf("%s: the docker CLI carries the tag: %q", q, e)
+			}
+		}
+		args[4] = "RAIDMAN_EXEC=<tag>"
+		return args, ""
 	}
-	want := func(shell string) string { return "docker exec -it -- plex " + shell }
+	want := func(shell string) string { return "docker exec -it -e RAIDMAN_EXEC=<tag> -- plex " + shell }
 	for q, shell := range map[string]string{
 		"container=plex":                     "sh",
 		"container=plex&shell=bash":          "bash",
