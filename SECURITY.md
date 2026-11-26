@@ -53,7 +53,7 @@ On the flash drive, these files and everything below these directories are alway
 - `/boot/config/plugins/dynamix.my.servers` (Unraid API key secrets)
 - `/boot/config/plugins/raidman/settings.json` (this plugin's settings)
 
-Paths with a name longer than 255 bytes or a total length over 4095 bytes are refused (`400`) before anything on disk is touched: Unraid's user-share filesystem can crash on such a name. Errors never repeat the requested path.
+Paths with a name longer than 255 bytes or a total length over 4095 bytes (3840 bytes under `/mnt/user` and `/mnt/user0`) are refused (`400`) before anything on disk is touched: Unraid's user-share filesystem can crash on such a name, and it rewrites user-share paths to longer disk or pool paths. Symlinks are resolved one component at a time and the same limits are applied to every link target and to the path it expands to before the next lookup, so a link on disk cannot hand an over-long name to the filesystem either. Errors never repeat the requested path.
 
 The check compares file identity (the resolved target and each of its parent directories), not names, because the flash drive is case-insensitive vfat: `/boot/CONFIG/Shadow` or a symlink to it is refused too. With **Host Terminal Access** disabled, an `ADMIN` key can still browse the shares and the rest of `/boot`, but never these files.
 

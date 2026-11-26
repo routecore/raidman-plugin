@@ -115,10 +115,15 @@ Details:
   is `null`.
 - **Files** are read-only. Paths are canonicalised (`..` refused, symlinks resolved) and must stay under
   `/mnt/user`, `/mnt/user0`, `/mnt/disk<N>`, `/mnt/cache`, `/mnt/<pool>` (pools from `/boot/config/pools/*.cfg`)
-  or `/boot`; the opened descriptor is checked again. A name over 255 bytes or a path over 4095 bytes is refused
-  with `400` before the filesystem is touched (an over-long name crashes Unraid's shfs). Errors never echo the
-  path; a filesystem failure answers `500` with the system's reason only (e.g. `transport endpoint is not
-  connected`). Directories first, at most 5000 entries per page; `mtime` is
+  or `/boot`; the opened descriptor is checked again. A name over 255 bytes or a path over 4095 bytes (3840 bytes
+  under `/mnt/user` and `/mnt/user0`, where shfs rewrites the path to a longer disk or pool path) is refused
+  with `400` before the filesystem is touched (an over-long name crashes Unraid's shfs). The same limits apply
+  to symlink targets and to the path a link expands to, before anything below them is looked up: such a link is
+  refused with `400` when opened and listed without `targetType`. More than 40 links in one path answer `500`
+  (`too many levels of symbolic links`). Errors never echo the path; `403` is only a policy refusal (outside the
+  roots, a protected file) or a permission error, and any other filesystem failure answers `500` with the
+  system's reason only (e.g. `transport endpoint is not connected`, or a path swapped for a symlink while it
+  was opened). Directories first, at most 5000 entries per page; `mtime` is
   Unix seconds. On `/boot`, `config/shadow`, `config/passwd`, `config/smbpasswd`, `config/ssh`, `config/ssl`,
   `config/wireguard`, `config/wireless.cfg`, `config/secrets.tdb`, `config/*.key` (license keys, any case),
   `config/rclone`, `config/plugins/rclone/.rclone.conf`, `config/plugins/dynamix.my.servers` and

@@ -45,9 +45,11 @@ var (
 	MaxScan = 200000
 	// readChunk is how many entries are read from a directory at a time.
 	readChunk = 1024
-	// evalSymlinks resolves client paths and the configured bases (a hook
-	// for tests).
-	evalSymlinks = filepath.EvalSymlinks
+	// evalSymlinks resolves client paths, symlink entries and the
+	// configured bases (a hook for tests).
+	evalSymlinks = resolveSymlinks
+	// lstat is the lookup resolveSymlinks makes for each component.
+	lstat = os.Lstat
 )
 
 // deniedBoot lists files and directories (relative to BootDir) that are never
@@ -80,9 +82,21 @@ const deniedBootKeyDir = "config"
 // path is refused before anything touches the filesystem: Unraid's user
 // share filesystem (shfs, FUSE) crashes on an over-long name ("strcpy_share_path
 // ... path too long") and takes /mnt/user down until the array is restarted.
+//
+// Under /mnt/user and /mnt/user0 the limit is tighter (maxUserPathLen):
+// shfs serves each path from a disk or pool by rewriting its /mnt/user
+// prefix to /mnt/disk<N> or /mnt/<pool>, so the path it builds internally is
+// longer than the one it was given. Pool names are up to 64 bytes here
+// (poolNameRe), so the rewritten prefix ("/mnt/" + name) is at most 69 bytes;
+// leaving a whole name (255 bytes) of headroom keeps every rewritten path
+// below PATH_MAX with room to spare, and no real path comes near 3840 bytes.
 const (
-	maxNameLen = 255
-	maxPathLen = 4095
+	maxNameLen     = 255
+	maxPathLen     = 4095
+	maxUserPathLen = maxPathLen - maxNameLen
+	// maxSymlinks is the kernel's limit on links followed in one lookup
+	// (MAXSYMLINKS); more answers ELOOP.
+	maxSymlinks = 40
 )
 
 var (
@@ -106,7 +120,10 @@ var (
 // input) and a Go operation name. Only the errno text is kept as the reason
 // (e.g. "transport endpoint is not connected" when shfs is down).
 func fsError(err error) error {
+	var he *httperr.Error
 	switch {
+	case errors.As(err, &he): // already a client error (errTooLong, ...)
+		return err
 	case errors.Is(err, fs.ErrNotExist):
 		return errNotFound
 	case errors.Is(err, fs.ErrPermission):
@@ -127,7 +144,12 @@ func fsError(err error) error {
 // checkLength refuses a path, or one of its components, longer than the
 // kernel allows (see maxNameLen).
 func checkLength(raw string) error {
-	if len(raw) > maxPathLen {
+	return checkLengthMax(raw, maxPathLen)
+}
+
+// checkLengthMax is checkLength with max as the limit on the whole path.
+func checkLengthMax(raw string, max int) error {
+	if len(raw) > max {
 		return errTooLong
 	}
 	for _, seg := range strings.Split(raw, "/") {
@@ -136,6 +158,108 @@ func checkLength(raw string) error {
 		}
 	}
 	return nil
+}
+
+// userShareRoots returns /mnt/user and /mnt/user0 under every form of
+// MntDir (as configured and symlink-resolved), where maxUserPathLen applies.
+func userShareRoots() []string {
+	mnt := []string{filepath.Clean(MntDir)}
+	if r, err := walkSymlinks(MntDir, nil); err == nil && r != mnt[0] {
+		mnt = append(mnt, r)
+	}
+	out := make([]string, 0, 2*len(mnt))
+	for _, m := range mnt {
+		out = append(out, m+"/user", m+"/user0")
+	}
+	return out
+}
+
+// checkPathLength applies checkLength to p, with the tighter user-share
+// limit when p is inside one of userRoots.
+func checkPathLength(p string, userRoots []string) error {
+	for _, r := range userRoots {
+		if under(p, r) {
+			return checkLengthMax(p, maxUserPathLen)
+		}
+	}
+	return checkLength(p)
+}
+
+// resolveSymlinks returns the absolute path p with every symlink resolved,
+// like filepath.EvalSymlinks, except that no path longer than the limits
+// (see maxNameLen and maxUserPathLen) is ever looked up: symlink targets
+// come from the disk, not the client, so a link whose target holds an
+// over-long name would otherwise hand that name to shfs.
+func resolveSymlinks(p string) (string, error) {
+	return walkSymlinks(p, userShareRoots())
+}
+
+// walkSymlinks resolves p one component at a time. Every path is checked
+// (checkPathLength) before it is passed to Lstat, and every link target and
+// the path it expands to are checked before anything below them is looked
+// up; a violation answers errTooLong. More than maxSymlinks links answer
+// ELOOP, as the kernel would.
+func walkSymlinks(p string, userRoots []string) (string, error) {
+	if !filepath.IsAbs(p) {
+		return "", &fs.PathError{Op: "resolve", Path: p, Err: syscall.EINVAL}
+	}
+	if err := checkPathLength(filepath.Clean(p), userRoots); err != nil {
+		return "", err
+	}
+	dest := "/"
+	rest := p
+	links := 0
+	for rest != "" {
+		var name string
+		name, rest, _ = strings.Cut(rest, "/")
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			// dest has no symlinks left, so its lexical parent is the
+			// real one.
+			dest = filepath.Dir(dest)
+			continue
+		}
+		next := filepath.Join(dest, name)
+		if err := checkPathLength(next, userRoots); err != nil {
+			return "", err
+		}
+		fi, err := lstat(next)
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			if !fi.IsDir() && rest != "" {
+				return "", &fs.PathError{Op: "lstat", Path: next, Err: syscall.ENOTDIR}
+			}
+			dest = next
+			continue
+		}
+		if links++; links > maxSymlinks {
+			return "", &fs.PathError{Op: "lstat", Path: next, Err: syscall.ELOOP}
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			return "", err
+		}
+		if err := checkLength(target); err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(target) {
+			dest = "/"
+		}
+		if rest != "" {
+			target += "/" + rest
+		}
+		rest = target
+		// The whole path the link expands to, before any of it is
+		// looked up.
+		if err := checkPathLength(dest+"/"+rest, userRoots); err != nil {
+			return "", err
+		}
+	}
+	return dest, nil
 }
 
 // Entry is one directory entry. Mtime is Unix epoch seconds.
@@ -286,9 +410,11 @@ func (d denySet) covers(p string, self fs.FileInfo) bool {
 }
 
 // Resolve validates a client path and returns its canonical form (all
-// symlinks resolved). 400: empty, relative, NUL or too long; 403: ".."
-// segments, outside the roots (before or after resolving) or a denied /boot
-// path; 422: missing. Errors never echo the path.
+// symlinks resolved, see resolveSymlinks). 400: empty, relative, NUL or too
+// long (the path, a link target or a link's expansion); 403: ".." segments,
+// outside the roots (before or after resolving) or a denied /boot path; 422:
+// missing; 500: any other filesystem error (ELOOP, EIO ...) with its reason.
+// Errors never echo the path.
 func Resolve(raw string) (string, error) {
 	if raw == "" {
 		return "", httperr.New(http.StatusBadRequest, "path missing")
@@ -394,18 +520,24 @@ func ListContext(ctx context.Context, raw string, opt ListOptions) (Listing, err
 	// blocking in open.
 	d, err := os.OpenFile(p, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return Listing{}, errNotFound
-		}
-		return Listing{}, errForbidden
+		// ENOENT 422, EACCES 403, anything else (ELOOP: the directory was
+		// swapped for a symlink; ENOTDIR; EIO ...) 500 with the reason.
+		return Listing{}, fsError(err)
 	}
 	defer d.Close()
 	fi, err := d.Stat()
-	if err != nil || !fi.IsDir() {
+	if err != nil {
+		return Listing{}, fsError(err)
+	}
+	if !fi.IsDir() {
 		return Listing{}, httperr.New(http.StatusBadRequest, "not a directory")
 	}
 	// Re-check through the descriptor (a component swapped after Resolve).
-	if real, err := openedPath(d); err != nil || !Allowed(real) || loadDenied().covers(real, fi) {
+	real, err := openedPath(d)
+	if err != nil {
+		return Listing{}, fsError(err)
+	}
+	if !Allowed(real) || loadDenied().covers(real, fi) {
 		return Listing{}, errForbidden
 	}
 
@@ -483,8 +615,12 @@ func ListContext(ctx context.Context, raw string, opt ListOptions) (Listing, err
 		case "file":
 			e.Size = info.Size()
 		case "symlink":
-			// Size of the target only when the target is itself allowed
-			// (never stat outside the roots or a denied path).
+			// Resolving the link looks up each component of its target,
+			// wherever it points (the lengths are checked first, see
+			// resolveSymlinks); a target that cannot be resolved, or whose
+			// path is too long, is left unresolved (no targetType). Only a
+			// target inside the roots is stat'ed, and a denied one only
+			// marks the entry protected.
 			if target, err := evalSymlinks(full); err == nil && rootOf(target, poolSet) != "" {
 				if !deniedLoaded {
 					denied, deniedLoaded = loadDenied(), true
@@ -523,18 +659,24 @@ func Open(raw string) (*os.File, fs.FileInfo, error) {
 	}
 	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil, errNotFound
-		}
-		return nil, nil, errForbidden
+		// As in ListContext: only EACCES is 403, ELOOP and the rest 500.
+		return nil, nil, fsError(err)
 	}
 	real, err := openedPath(f)
-	if err != nil || !Allowed(real) {
+	if err != nil {
+		f.Close()
+		return nil, nil, fsError(err)
+	}
+	if !Allowed(real) {
 		f.Close()
 		return nil, nil, errForbidden
 	}
 	fi, err = f.Stat()
-	if err != nil || !fi.Mode().IsRegular() {
+	if err != nil {
+		f.Close()
+		return nil, nil, fsError(err)
+	}
+	if !fi.Mode().IsRegular() {
 		f.Close()
 		return nil, nil, httperr.New(http.StatusBadRequest, "not a file")
 	}
