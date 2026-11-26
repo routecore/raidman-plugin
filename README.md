@@ -235,13 +235,16 @@ VM is still served. (`docker`/`docker-log` on a missing or stopped container sen
 close with `1000` `process exited (1)`.)
 
 Terminals start at 80x24 until the client sends its size. Closing a container console (`docker`), or losing
-its connection, ends it like an ssh disconnect: the shell started in the container (found by a random
-`RAIDMAN_EXEC=<tag>` variable, among that container's processes only) and the terminal's foreground job are
-hung up (`SIGHUP`); after 3 s the shell and whatever is still in its session are killed, except processes that
-ignore `SIGHUP`. Deliberately detached work survives: `nohup` jobs, and anything that left the session
-(`setsid`, daemons, the `tmux`/`screen` server). Interactive programs and plain background jobs end with the
-console. Older plugins only stopped the `docker exec` client, which left the shell and its children running in
-the container.
+its connection, ends it like an ssh disconnect: the shell started in the container (identified while the
+console is open by a random `RAIDMAN_EXEC=<tag>` variable, among that container's processes only, and recorded
+by pid and start time) and the terminal's foreground job are hung up (`SIGHUP`); after 3 s the shell and
+whatever is still in its session are killed, except processes that ignore `SIGHUP`. If the shell already exited
+(`exit`, Ctrl-D), only what is left in its session is hung up and then killed. Deliberately detached work
+survives: `nohup` jobs, and anything that left the session (`setsid`, daemons, the `tmux`/`screen` server),
+even though it carries the same variable; it is never mistaken for the shell. If the connection dropped before
+the shell was seen and the shell cannot be told apart unambiguously at the end, nothing is signalled.
+Interactive programs and plain background jobs end with the console. Older plugins only stopped the
+`docker exec` client, which left the shell and its children running in the container.
 
 **Terminal resize** (`host`, `docker`, `vm`): send a *text* frame that is exactly either
 `\x1b[8;<rows>;<cols>t` or the JSON object `{"type":"resize","cols":N,"rows":M}` (1–1000). Any other frame

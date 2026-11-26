@@ -42,9 +42,10 @@ func ptyStream(termType string) func(a *Api, ws *wsConn, r *http.Request, k *aut
 // buildPtyCommand validates the request and builds the command for a PTY
 // stream. User-supplied values only ever appear as single argv entries after
 // validation (and after "--" where the tool supports it); nothing goes
-// through a shell. onEnd, when not nil, runs on its own goroutine once the
-// session has ended; cliExited is closed when the command has exited.
-func (a *Api) buildPtyCommand(termType string, r *http.Request) (cmd *exec.Cmd, errMsg string, onEnd func(cliExited <-chan struct{})) {
+// through a shell. watch, when not nil (container consoles), is started
+// once the command runs and ended once the session has ended (see
+// execWatch).
+func (a *Api) buildPtyCommand(termType string, r *http.Request) (cmd *exec.Cmd, errMsg string, watch *execWatch) {
 	q := r.URL.Query()
 	termEnv := append(os.Environ(), "TERM=xterm-256color")
 	switch termType {
@@ -76,7 +77,7 @@ func (a *Api) buildPtyCommand(termType string, r *http.Request) (cmd *exec.Cmd, 
 				shell = s
 			}
 			// The tag marks the processes started in the container (see
-			// endExecSession); it is passed to the container only, never
+			// execWatch); it is passed to the container only, never
 			// set in the docker CLI's own environment.
 			tag, err := newExecTag()
 			if err != nil {
@@ -90,7 +91,7 @@ func (a *Api) buildPtyCommand(termType string, r *http.Request) (cmd *exec.Cmd, 
 			cancel()
 			cmd := exec.Command("docker", "exec", "-it", "-e", execTagEnv+"="+tag, "--", id, shell)
 			cmd.Env = termEnv
-			return cmd, "", func(cliExited <-chan struct{}) { endExecSession(id, fullID, tag, cliExited) }
+			return cmd, "", newExecWatch(id, fullID, tag)
 		}
 		return exec.Command("docker", "logs", "-f", "--tail", "100", "--", id), "", nil
 
@@ -158,7 +159,7 @@ const errHostTerminalDisabled = "Error: Host terminal access is disabled by admi
 const hangupGrace = 3 * time.Second
 
 func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Key) {
-	cmd, errMsg, onEnd := a.buildPtyCommand(termType, r)
+	cmd, errMsg, watch := a.buildPtyCommand(termType, r)
 	if cmd == nil {
 		_ = ws.WriteText(errMsg)
 		// Nothing else reads this socket; drain it so the peer's close
@@ -172,7 +173,7 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 		return
 	}
 	log.Printf("[AUDIT] Starting PTY session %q by key %s from %q", termType, k.Label(), truncate(clientIP(r), 64))
-	if onEnd != nil {
+	if watch != nil {
 		// Counted from here so Shutdown waits for the cleanup (see
 		// waitExecCleanups).
 		a.execCleanups.Add(1)
@@ -185,7 +186,7 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 	// before the first resize would otherwise misrender.
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: defaultCols, Rows: defaultRows})
 	if err != nil {
-		if onEnd != nil {
+		if watch != nil {
 			a.execCleanups.Add(-1)
 		}
 		_ = ws.WriteText("Error starting pty: " + err.Error())
@@ -194,6 +195,10 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 		return
 	}
 	master := pollableMaster(ptmx)
+	if watch != nil {
+		// Records the exec'd shell while the console is open.
+		watch.start()
+	}
 
 	// The watcher below may signal the process group only while the leader
 	// has not been reaped (a reaped pid/pgid can be recycled), so the
@@ -206,14 +211,14 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 		watcher.Wait()
 		_ = master.Close()
 		// Killing the docker CLI alone would leave the container's
-		// processes running, so onEnd ends them, on its own goroutine:
+		// processes running, so the watch ends them, on its own goroutine:
 		// it reads /proc and may block on a stuck process, and must
 		// never keep the CLI alive or the stream slot held.
 		cliExited := make(chan struct{})
-		if onEnd != nil {
+		if watch != nil {
 			go func() {
 				defer a.execCleanups.Add(-1)
-				onEnd(cliExited)
+				watch.end(cliExited)
 			}()
 		}
 		terminateGroup(cmd)

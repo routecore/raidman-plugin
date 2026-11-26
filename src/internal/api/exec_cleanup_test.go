@@ -36,12 +36,17 @@ func newFakeProc(t *testing.T) *fakeProc {
 	oldRoot, oldSig, oldPidfd, oldRead, oldID := procRoot, signalProcess, openPidfd, readProcFile, containerFullID
 	oldPidfdSig, oldPidfdClose := sendPidfdSignal, closePidfd
 	oldGrace, oldPoll, oldLate, oldRT, oldCT := execHupGrace, execPollEvery, execLateStart, execReadTimeout, execCleanupTimeout
+	oldWP, oldWMax, oldWFor, oldMax, oldReads := execWatchPoll, execWatchMaxPoll, execWatchFor, maxProcReads, procReads
 	t.Cleanup(func() {
 		procRoot, signalProcess, openPidfd, readProcFile, containerFullID = oldRoot, oldSig, oldPidfd, oldRead, oldID
 		sendPidfdSignal, closePidfd = oldPidfdSig, oldPidfdClose
 		execHupGrace, execPollEvery, execLateStart, execReadTimeout, execCleanupTimeout = oldGrace, oldPoll, oldLate, oldRT, oldCT
+		execWatchPoll, execWatchMaxPoll, execWatchFor, maxProcReads, procReads = oldWP, oldWMax, oldWFor, oldMax, oldReads
 	})
 	procRoot = fp.root
+	// Reads abandoned by an earlier test settle into that test's state.
+	procReads = newProcReadState()
+	execWatchPoll, execWatchMaxPoll, execWatchFor = 5*time.Millisecond, 20*time.Millisecond, 10*time.Second
 	signalProcess = func(pid int, sig syscall.Signal) error {
 		t.Errorf("unexpected signal %v to %d", sig, pid)
 		return nil
@@ -66,7 +71,9 @@ func newFakeProc(t *testing.T) *fakeProc {
 type fproc struct {
 	pid              int
 	comm, state      string
+	ppid             int // 0 (the default) is no process: outside the container
 	pgid, sid, tpgid int
+	notty            bool // no controlling terminal
 	start            string
 	ctr              string // container id in its cgroup ("" = host)
 	nohup            bool   // ignores SIGHUP
@@ -86,8 +93,12 @@ func (fp *fakeProc) add(p fproc) {
 	// Fields 3..22 (state ppid pgrp session tty_nr tpgid flags minflt
 	// cminflt majflt cmajflt utime stime cutime cstime priority nice
 	// threads itrealvalue starttime), then a few more.
-	stat := fmt.Sprintf("%d (%s) %s 1 %d %d 34816 %d 4194560 100 0 0 0 1 2 0 0 20 0 1 0 %s 1000 200 0 0",
-		p.pid, p.comm, p.state, p.pgid, p.sid, p.tpgid, p.start)
+	tty := 34816 // pts/0
+	if p.notty {
+		tty = 0
+	}
+	stat := fmt.Sprintf("%d (%s) %s %d %d %d %d %d 4194560 100 0 0 0 1 2 0 0 20 0 1 0 %s 1000 200 0 0",
+		p.pid, p.comm, p.state, p.ppid, p.pgid, p.sid, tty, p.tpgid, p.start)
 	environ := ""
 	if len(p.env) > 0 {
 		environ = strings.Join(p.env, "\x00") + "\x00"
@@ -157,30 +168,63 @@ func closedChan() <-chan struct{} {
 
 const testTag = "0123456789abcdef0123456789abcdef"
 
+// endExecSession ends a session whose shell the watch never recorded (the
+// socket dropped before it was seen).
+func endExecSession(ref, fullID, tag string, cliExited <-chan struct{}) {
+	newExecWatch(ref, fullID, tag).end(cliExited)
+}
+
+// watchUntilRecorded starts a watch and waits until it has recorded the
+// shell (or stopped: then the test fails).
+func watchUntilRecorded(t *testing.T, ref, fullID, tag string) *execWatch {
+	t.Helper()
+	w := newExecWatch(ref, fullID, tag)
+	w.start()
+	select {
+	case <-w.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watch did not stop")
+	}
+	if !w.found {
+		t.Fatal("the watch recorded no shell")
+	}
+	return w
+}
+
 // TestEndExecSession builds a console session in a container (the shell
 // leads its session; a foreground job; background jobs, one nohup'd; jobs
 // moved to their own sessions) among decoys, and checks the ssh-like
 // semantics: the shell and the foreground group are hung up, what is left
 // in the session after the grace period is killed except what ignores
 // SIGHUP, and nothing outside the session or the container is touched.
+// The same whether the watch recorded the shell or it is found at the end.
 func TestEndExecSession(t *testing.T) {
+	for _, recorded := range []bool{true, false} {
+		t.Run(fmt.Sprintf("recorded=%v", recorded), func(t *testing.T) { testEndExecSession(t, recorded) })
+	}
+}
+
+func testEndExecSession(t *testing.T, recorded bool) {
 	fp := newFakeProc(t)
 	mark := execTagEnv + "=" + testTag
 	path := "PATH=/usr/bin"
 
-	// The session: the shell (500) ignores SIGHUP; the foreground group
-	// 510 is running top (exits on SIGHUP) and a nohup'd child.
+	// The session: the shell (500, child of the runtime outside the
+	// container) ignores SIGHUP; the foreground group 510 is running top
+	// (exits on SIGHUP) and a nohup'd child.
 	fp.add(fproc{pid: 500, comm: "sh", pgid: 500, sid: 500, tpgid: 510, start: "1000", ctr: ctrID, env: []string{path, mark}})
-	fp.add(fproc{pid: 510, comm: "top", pgid: 510, sid: 500, tpgid: 510, start: "1010", ctr: ctrID, env: []string{"HOME=/x"}}) // env dropped (su -)
-	fp.add(fproc{pid: 511, comm: "nohup fg", pgid: 510, sid: 500, tpgid: 510, start: "1011", ctr: ctrID, nohup: true, env: []string{mark}})
-	fp.add(fproc{pid: 501, comm: "sleep", pgid: 501, sid: 500, start: "1001", ctr: ctrID, env: []string{mark}})                    // background job
-	fp.add(fproc{pid: 502, comm: "nohup (x) y", pgid: 502, sid: 500, start: "1002", ctr: ctrID, nohup: true, env: []string{mark}}) // nohup &
-	fp.add(fproc{pid: 503, comm: "dead", state: "Z", pgid: 500, sid: 500, start: "1003", ctr: ctrID})                              // zombie
+	fp.add(fproc{pid: 510, comm: "top", ppid: 500, pgid: 510, sid: 500, tpgid: 510, start: "1010", ctr: ctrID, env: []string{"HOME=/x"}}) // env dropped (su -)
+	fp.add(fproc{pid: 511, comm: "nohup fg", ppid: 510, pgid: 510, sid: 500, tpgid: 510, start: "1011", ctr: ctrID, nohup: true, env: []string{mark}})
+	fp.add(fproc{pid: 501, comm: "sleep", ppid: 500, pgid: 501, sid: 500, start: "1001", ctr: ctrID, env: []string{mark}})                    // background job
+	fp.add(fproc{pid: 502, comm: "nohup (x) y", ppid: 500, pgid: 502, sid: 500, start: "1002", ctr: ctrID, nohup: true, env: []string{mark}}) // nohup &
+	fp.add(fproc{pid: 503, comm: "dead", ppid: 500, state: "Z", pgid: 500, sid: 500, start: "1003", ctr: ctrID})                              // zombie
 	// Left the session: setsid'd (still tagged, a session leader itself,
-	// but younger than the shell), and a tmux server.
-	fp.add(fproc{pid: 504, comm: "setsid", pgid: 504, sid: 504, start: "1004", ctr: ctrID, env: []string{path, mark}})
-	fp.add(fproc{pid: 505, comm: "tmux", pgid: 505, sid: 505, start: "1005", ctr: ctrID, env: []string{mark}})
-	fp.add(fproc{pid: 506, comm: "child", pgid: 504, sid: 504, start: "1006", ctr: ctrID})
+	// but a child of the shell), a tmux server (no terminal) and one of its
+	// panes (a terminal, but a child of the server).
+	fp.add(fproc{pid: 504, comm: "setsid", ppid: 500, pgid: 504, sid: 504, notty: true, start: "1004", ctr: ctrID, env: []string{path, mark}})
+	fp.add(fproc{pid: 505, comm: "tmux", ppid: 1, pgid: 505, sid: 505, notty: true, start: "1005", ctr: ctrID, env: []string{mark}})
+	fp.add(fproc{pid: 509, comm: "pane", ppid: 505, pgid: 509, sid: 509, start: "1009", ctr: ctrID, env: []string{mark}})
+	fp.add(fproc{pid: 506, comm: "child", ppid: 504, pgid: 504, sid: 504, start: "1006", ctr: ctrID})
 	// Decoys.
 	fp.add(fproc{pid: 1, comm: "init", pgid: 1, sid: 1, start: "1", ctr: ctrID, env: []string{mark}}) // never pid 1
 	fp.add(fproc{pid: 600, comm: "docker", pgid: 600, sid: 600, start: "2000", env: []string{path}})  // the CLI: tag only in argv
@@ -193,6 +237,13 @@ func TestEndExecSession(t *testing.T) {
 	fp.add(fproc{pid: 606, comm: "same group", pgid: syscall.Getpgrp(), sid: 500, start: "2006", ctr: ctrID, env: []string{mark}})
 	os.WriteFile(filepath.Join(fp.root, "600", "cmdline"), []byte("docker\x00exec\x00-e\x00"+mark+"\x00"), 0o644)
 
+	w := newExecWatch("plex", ctrID, testTag)
+	if recorded {
+		w = watchUntilRecorded(t, "plex", ctrID, testTag)
+		if w.shell.pid != 500 {
+			t.Fatalf("recorded %d as the shell", w.shell.pid)
+		}
+	}
 	late := false
 	signals, sig := recorder(func(pid int, sig syscall.Signal) {
 		if sig == syscall.SIGHUP && pid != 500 && pid != 511 {
@@ -201,7 +252,7 @@ func TestEndExecSession(t *testing.T) {
 		if !late {
 			// A process started in the session after the first scan.
 			late = true
-			fp.add(fproc{pid: 508, comm: "late", pgid: 500, sid: 500, start: "1008", ctr: ctrID})
+			fp.add(fproc{pid: 508, comm: "late", ppid: 500, pgid: 500, sid: 500, start: "1008", ctr: ctrID})
 		}
 		if sig == syscall.SIGHUP && pid == 510 {
 			// 510 reused by an unrelated process.
@@ -209,7 +260,7 @@ func TestEndExecSession(t *testing.T) {
 		}
 	})
 	signalProcess = sig
-	endExecSession("plex", ctrID, testTag, closedChan())
+	w.end(closedChan())
 
 	hup, kill := signals()
 	if want := []int{500, 510, 511}; !reflect.DeepEqual(hup, want) {
