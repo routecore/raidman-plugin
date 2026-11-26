@@ -438,9 +438,11 @@ func (a *Api) handleNoVNC(w http.ResponseWriter, r *http.Request, k *auth.Key, s
 	// work without the key itself ever being stored in a plugin cookie.
 	if (src == authHeader || src == authKeyCookie) && !a.hasSessionFor(r, k) {
 		if id, err := a.sessions.create(k.Hash()); err == nil {
-			// Secure when nginx was reached over HTTPS, or a proxy/tunnel in
-			// front of it was (X-Raidman-Client-Proto, set by raidman.conf).
-			// Only ever adds the flag, so a spoofed value cannot weaken it.
+			// Secure when the browser's own hop used HTTPS (clientUsedHTTPS:
+			// the proxy's X-Forwarded-Proto when one sent it, else nginx's
+			// scheme). A browser on an http:// proxy in front of an HTTPS
+			// Unraid would never send a Secure cookie back. Browsers cannot
+			// set these headers, so a page cannot drop the flag for a victim.
 			isSecure := clientUsedHTTPS(r)
 			http.SetCookie(w, &http.Cookie{
 				Name:     sessionCookieName,
