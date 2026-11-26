@@ -12,6 +12,7 @@ import (
 	"github.com/routecore/raidman-plugin/src/internal/api"
 	"github.com/routecore/raidman-plugin/src/internal/domain"
 	"github.com/routecore/raidman-plugin/src/internal/monitor"
+	"github.com/routecore/raidman-plugin/src/internal/service/array"
 	"github.com/routecore/raidman-plugin/src/internal/service/auth"
 	"github.com/routecore/raidman-plugin/src/internal/service/config"
 )
@@ -49,6 +50,10 @@ func (o *Orchestrator) Run() error {
 	mime.AddExtensionType(".svg", "image/svg+xml")
 	mime.AddExtensionType(".json", "application/json")
 	mime.AddExtensionType(".wasm", "application/wasm")
+
+	// Parity history and pause stamps, which Unraid only keeps while a
+	// browser has the webGUI open (see array/parity_log.go).
+	go array.DefaultParityLogger.Run(ctx, 5*time.Second)
 
 	server := api.Create(o.ctx, keys)
 	serverErr := make(chan error, 1)

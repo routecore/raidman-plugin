@@ -86,6 +86,11 @@ func v2Fixtures(t *testing.T) *fakeEmcmd {
 	array.DisksIniPath = "../service/array/testdata/disks_state.ini"
 	array.DevsIniPath = "../service/array/testdata/devs.ini"
 	array.Emcmd = em
+	oldParity := []string{array.StampsPath, array.ResyncPath, array.ParityLogPath}
+	array.StampsPath, array.ResyncPath, array.ParityLogPath = filepath.Join(dir, "stamps.ini"), filepath.Join(dir, "resync.ini"), filepath.Join(dir, "parity-checks.log")
+	t.Cleanup(func() {
+		array.StampsPath, array.ResyncPath, array.ParityLogPath = oldParity[0], oldParity[1], oldParity[2]
+	})
 	healthVarIni = varIni
 	healthUnraidVersion = filepath.Join(dir, "unraid-version")
 

@@ -37,7 +37,12 @@ func withFixtures(t *testing.T, varIni string) *fakeEmcmd {
 	DevsIniPath = write("devs.ini", string(devs))
 	f := &fakeEmcmd{}
 	Emcmd = f
-	t.Cleanup(func() { VarIniPath, DisksIniPath, DevsIniPath, Emcmd = oldVar, oldDisks, oldDevs, oldEm })
+	oldStamps, oldResync, oldLog := StampsPath, ResyncPath, ParityLogPath
+	StampsPath, ResyncPath, ParityLogPath = filepath.Join(dir, "stamps.ini"), filepath.Join(dir, "resync.ini"), filepath.Join(dir, "parity-checks.log")
+	t.Cleanup(func() {
+		VarIniPath, DisksIniPath, DevsIniPath, Emcmd = oldVar, oldDisks, oldDevs, oldEm
+		StampsPath, ResyncPath, ParityLogPath = oldStamps, oldResync, oldLog
+	})
 	return f
 }
 

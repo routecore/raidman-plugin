@@ -169,10 +169,13 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 			// (ArrayOperation.page): mdResync != 0 while running, 0 while
 			// paused. Kept identical to ReadParityState so the app never
 			// offers an action the parity endpoints then refuse.
+			// Running stays true while paused (an operation is in progress, as
+			// protocol-1 apps expect); Paused tells the two apart.
 			if parseInt("mdResync") != 0 {
 				status.ParityCheckStatus.Status = "RUNNING_" + suffix
 			} else {
 				status.ParityCheckStatus.Status = "PAUSED_" + suffix
+				status.ParityCheckStatus.Paused = true
 			}
 
 			if speedBytesPerSec > 0 {
@@ -189,9 +192,11 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 
 			// sbSynced is set when the operation starts and sbSyncErrs
 			// counts the errors of that operation.
+			// emhttpd moves sbSynced on resume; the first start is kept in
+			// stamps.ini (see parity_log.go), like the webGUI's elapsed time.
 			status.ParityCheckStatus.Duration = 0
-			if synced > 0 {
-				if elapsed := nowFunc().Unix() - synced; elapsed > 0 {
+			if start := operationStart(synced); start > 0 {
+				if elapsed := nowFunc().Unix() - start; elapsed > 0 {
 					status.ParityCheckStatus.Duration = elapsed
 				}
 			}

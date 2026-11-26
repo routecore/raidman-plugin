@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -142,8 +143,24 @@ func ParityAction(ctx context.Context, action string, correct bool) error {
 	default:
 		return badRequest("invalid parity action: %s", action)
 	}
+	if action == "start" {
+		if err := DefaultParityLogger.beforeStart(); err != nil {
+			log.Printf("parity history before start: %v", err)
+		}
+	}
 	if err := Emcmd.Cmd(ctx, params); err != nil {
 		return fmt.Errorf("parity %s failed: %w", action, err)
+	}
+	// Same bookkeeping as the webGUI's Pause/Resume buttons, so elapsed
+	// time and the history duration leave out the paused time.
+	if action == "pause" || action == "resume" {
+		sbSynced := ""
+		if vars, err := emhttp.ReadIni(VarIniPath); err == nil {
+			sbSynced = vars["sbSynced"]
+		}
+		if err := recordParityStamp(action == "pause", sbSynced); err != nil {
+			log.Printf("parity %s: could not record time stamp: %v", action, err)
+		}
 	}
 	return nil
 }
