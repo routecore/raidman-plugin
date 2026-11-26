@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/routecore/raidman-plugin/src/internal/service/array"
 	"github.com/routecore/raidman-plugin/src/internal/service/auth"
@@ -442,8 +441,7 @@ func (a *Api) handleNoVNC(w http.ResponseWriter, r *http.Request, k *auth.Key, s
 			// Secure when nginx was reached over HTTPS, or a proxy/tunnel in
 			// front of it was (X-Raidman-Client-Proto, set by raidman.conf).
 			// Only ever adds the flag, so a spoofed value cannot weaken it.
-			isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" ||
-				strings.EqualFold(r.Header.Get("X-Raidman-Client-Proto"), "https")
+			isSecure := clientUsedHTTPS(r)
 			http.SetCookie(w, &http.Cookie{
 				Name:     sessionCookieName,
 				Value:    id,
@@ -455,6 +453,10 @@ func (a *Api) handleNoVNC(w http.ResponseWriter, r *http.Request, k *auth.Key, s
 			})
 		}
 	}
+	// These responses need a key, so no shared cache (Cloudflare caches .js
+	// and .css by default) may keep them; revalidation still works through
+	// Last-Modified, and a plugin update is picked up at once.
+	w.Header().Set("Cache-Control", "private, no-cache")
 	a.novnc.ServeHTTP(w, r)
 }
 

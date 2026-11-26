@@ -307,6 +307,13 @@ func isSafeOrigin(r *http.Request) bool {
 	if scheme != "http" && scheme != "https" {
 		return false
 	}
+	// A page loaded over plain HTTP must not drive a connection the client
+	// made over HTTPS (an injected http:// page on the same host would
+	// otherwise ride the Secure cookie). Only the client-proto signals that
+	// can tighten this are used, so a spoofed header cannot loosen it.
+	if scheme == "http" && clientUsedHTTPS(r) {
+		return false
+	}
 	originPort := u.Port()
 	if originPort == "" {
 		originPort = defaultPort(scheme)
@@ -328,6 +335,14 @@ func isSafeOrigin(r *http.Request) bool {
 		return originPort == defaultPort(scheme)
 	}
 	return originPort == port
+}
+
+// clientUsedHTTPS reports whether the browser reached nginx, or the proxy or
+// tunnel in front of it, over HTTPS (X-Raidman-Client-Proto is set by
+// raidman.conf).
+func clientUsedHTTPS(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" ||
+		strings.EqualFold(r.Header.Get("X-Raidman-Client-Proto"), "https")
 }
 
 func defaultPort(scheme string) string {

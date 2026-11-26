@@ -515,3 +515,28 @@ func TestKeyShaped(t *testing.T) {
 		}
 	}
 }
+
+// An http:// page cannot drive a connection the client made over HTTPS.
+func TestSafeOriginClientProto(t *testing.T) {
+	cases := []struct {
+		origin, proto string
+		want          bool
+	}{
+		{"https://tower", "https", true},
+		{"http://tower", "https", false},
+		{"http://tower", "", true}, // LAN plain HTTP
+		{"http://tower", "http", true},
+		{"https://tower", "", true},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodGet, "/x", nil)
+		r.Host = "tower"
+		r.Header.Set("Origin", c.origin)
+		if c.proto != "" {
+			r.Header.Set("X-Raidman-Client-Proto", c.proto)
+		}
+		if got := isSafeOrigin(r); got != c.want {
+			t.Errorf("origin=%q proto=%q: got %v want %v", c.origin, c.proto, got, c.want)
+		}
+	}
+}
