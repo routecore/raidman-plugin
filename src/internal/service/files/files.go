@@ -5,9 +5,15 @@
 // (pools from /boot/config/pools/*.cfg) and /boot. Every path is checked
 // twice: lexically on the client's input (so nothing outside the roots is
 // even stat'ed) and again after all symlinks are resolved (a link inside a
-// share that points to /etc is refused). Opened files are checked a third
-// time through the open descriptor (see openedPath), so swapping a path
-// component for a symlink after the check does not escape the roots.
+// share that points to /etc is refused). The resolved path is then opened
+// without following any symlink (see openNoFollow), so a path component
+// swapped for a symlink after the check is neither followed nor looked up,
+// and opened files are checked a third time through the open descriptor
+// (see openedPath). Residual: the lookups made before the open (Resolve's
+// own walk, the deny-list checks of ancestors in denySet.covers, the stat
+// of a listed symlink's target) still go by path, so a component swapped
+// for a symlink during those few lookups would be followed by the kernel.
+// Their lengths are checked first, but the swapped link's target is not.
 //
 // Inside /boot, credentials and private keys are refused (see deniedBoot):
 // the resolved target and each of its ancestors are compared by file
@@ -30,6 +36,8 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/routecore/raidman-plugin/src/internal/service/httperr"
 )
@@ -260,6 +268,80 @@ func walkSymlinks(p string, userRoots []string) (string, error) {
 		}
 	}
 	return dest, nil
+}
+
+var (
+	errNotDir  = &httperr.Error{Status: http.StatusBadRequest, Msg: "not a directory"}
+	errNotFile = &httperr.Error{Status: http.StatusBadRequest, Msg: "not a file"}
+)
+
+// openNoFollow opens the resolved path p (see Resolve) without following any
+// symlink: p is walked from / one component at a time, each opened relative
+// to the directory above it with O_NOFOLLOW. So the names looked up are
+// exactly p's, whose lengths Resolve checked, even if a component is swapped
+// for a symlink meanwhile: that component then fails (ELOOP, or ENOTDIR on
+// the way down) instead of having its target looked up (shfs, see
+// maxNameLen). dir asks for a directory, else a regular file; the last
+// component is checked with lstat before it is opened, so another type
+// answers errNotDir or errNotFile without being opened (a FIFO would block,
+// a device could act on open), and is opened with O_NONBLOCK in case it is
+// swapped meanwhile (the caller checks the type again on the descriptor).
+func openNoFollow(p string, dir bool) (*os.File, error) {
+	clean := filepath.Clean(p)
+	if !filepath.IsAbs(clean) || clean == "/" {
+		return nil, &fs.PathError{Op: "open", Path: p, Err: syscall.EINVAL}
+	}
+	names := strings.Split(clean[1:], "/")
+	fd, err := unix.Open("/", walkDirFlags, 0)
+	if err != nil {
+		return nil, &fs.PathError{Op: "open", Path: "/", Err: err}
+	}
+	defer func() { unix.Close(fd) }()
+	dirPath := "/"
+	for _, name := range names[:len(names)-1] {
+		next, err := unix.Openat(fd, name, walkDirFlags, 0)
+		if err != nil {
+			// A directory swapped for a symlink answers ENOTDIR (with
+			// O_DIRECTORY); report it as the kernel reports a link it will
+			// not follow.
+			if err == unix.ENOTDIR {
+				if fi, lerr := lstatAt(fd, dirPath, name); lerr == nil && fi.Mode()&fs.ModeSymlink != 0 {
+					err = unix.ELOOP
+				}
+			}
+			return nil, &fs.PathError{Op: "openat", Path: p, Err: err}
+		}
+		unix.Close(fd)
+		fd = next
+		dirPath = filepath.Join(dirPath, name)
+	}
+	name := names[len(names)-1]
+	fi, err := lstatAt(fd, dirPath, name)
+	switch {
+	case err != nil:
+		return nil, err
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return nil, &fs.PathError{Op: "open", Path: p, Err: syscall.ELOOP}
+	case dir && !fi.IsDir():
+		return nil, errNotDir
+	case !dir && !fi.Mode().IsRegular():
+		return nil, errNotFile
+	}
+	flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
+	if dir {
+		flags |= unix.O_DIRECTORY
+	}
+	ffd, err := unix.Openat(fd, name, flags, 0)
+	if err != nil {
+		return nil, &fs.PathError{Op: "openat", Path: p, Err: err}
+	}
+	// Back to blocking (it never mattered for a file or a directory) so
+	// the descriptor is used like any other opened file.
+	if err := unix.SetNonblock(ffd, false); err != nil {
+		unix.Close(ffd)
+		return nil, &fs.PathError{Op: "fcntl", Path: p, Err: err}
+	}
+	return os.NewFile(uintptr(ffd), clean), nil
 }
 
 // Entry is one directory entry. Mtime is Unix epoch seconds.
@@ -511,17 +593,11 @@ func ListContext(ctx context.Context, raw string, opt ListOptions) (Listing, err
 	if err != nil {
 		return Listing{}, err
 	}
-	if fi, err := os.Stat(p); err != nil {
-		return Listing{}, fsError(err)
-	} else if !fi.IsDir() {
-		return Listing{}, httperr.New(http.StatusBadRequest, "not a directory")
-	}
-	// O_DIRECTORY: a path swapped for a FIFO after the Stat fails instead of
-	// blocking in open.
-	d, err := os.OpenFile(p, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	d, err := openNoFollow(p, true)
 	if err != nil {
-		// ENOENT 422, EACCES 403, anything else (ELOOP: the directory was
-		// swapped for a symlink; ENOTDIR; EIO ...) 500 with the reason.
+		// ENOENT 422, EACCES 403, anything else (ELOOP or ENOTDIR: a
+		// component was swapped for a symlink; EIO ...) 500 with the
+		// reason.
 		return Listing{}, fsError(err)
 	}
 	defer d.Close()
@@ -598,16 +674,19 @@ func ListContext(ctx context.Context, raw string, opt ListOptions) (Listing, err
 		inBoot = inBoot || under(p, b)
 	}
 	userRoots := userShareRoots()
+	dfd := int(d.Fd())
 	for _, it := range page {
 		de := it.de
 		full := filepath.Join(p, de.Name())
 		if checkPathLength(full, userRoots) != nil {
-			// Too long to look up (de.Info is an lstat; see
-			// maxUserPathLen): listed by name and type only.
+			// Too long to look up (see maxUserPathLen): listed by name
+			// and type only.
 			out.Entries = append(out.Entries, Entry{Name: de.Name(), Path: full, Type: entryType(de.Type())})
 			continue
 		}
-		info, err := de.Info()
+		// Through the open directory: nothing above the entry is looked
+		// up again.
+		info, err := lstatAt(dfd, p, de.Name())
 		if err != nil {
 			continue // removed meanwhile
 		}
@@ -657,14 +736,7 @@ func Open(raw string) (*os.File, fs.FileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	fi, err := os.Stat(p)
-	if err != nil {
-		return nil, nil, fsError(err)
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, nil, httperr.New(http.StatusBadRequest, "not a file")
-	}
-	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := openNoFollow(p, false)
 	if err != nil {
 		// As in ListContext: only EACCES is 403, ELOOP and the rest 500.
 		return nil, nil, fsError(err)
@@ -678,7 +750,7 @@ func Open(raw string) (*os.File, fs.FileInfo, error) {
 		f.Close()
 		return nil, nil, errForbidden
 	}
-	fi, err = f.Stat()
+	fi, err := f.Stat()
 	if err != nil {
 		f.Close()
 		return nil, nil, fsError(err)

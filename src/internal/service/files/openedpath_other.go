@@ -4,8 +4,11 @@ package files
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/sys/unix"
 )
 
 // openedPath (non-Linux, development only): there is no /proc, so the opened
@@ -27,4 +30,13 @@ func openedPath(f *os.File) (string, error) {
 		return "", errors.New("file changed while opening")
 	}
 	return p, nil
+}
+
+// walkDirFlags (non-Linux): no O_PATH.
+const walkDirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+
+// lstatAt (non-Linux, development only) goes by path: there is no
+// /proc/self/fd to look up through the descriptor.
+func lstatAt(_ int, dirPath, name string) (fs.FileInfo, error) {
+	return os.Lstat(filepath.Join(dirPath, name))
 }

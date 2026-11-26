@@ -198,8 +198,8 @@ func TestSymlinkLoop(t *testing.T) {
 // ELOOP: a filesystem failure (500 with the reason), not a policy refusal.
 // Paths outside the roots stay 403.
 func TestOpenErrorsMatchREADME(t *testing.T) {
-	root, _ := fixture(t)
-	share := root + "/mnt/user/share"
+	_, real := fixture(t)
+	share := real + "/mnt/user/share" // no link above it (macOS: /var)
 	os.Symlink("sub", filepath.Join(share, "dir-link"))
 	os.Symlink("b.txt", filepath.Join(share, "file-link"))
 	orig := evalSymlinks
@@ -211,7 +211,6 @@ func TestOpenErrorsMatchREADME(t *testing.T) {
 		}
 		return orig(p)
 	}
-	// Linux answers ELOOP; macOS ENOTDIR (O_DIRECTORY wins there).
 	_, err := List(share + "/dir-link")
 	if httperr.StatusOf(err) != http.StatusInternalServerError || !strings.HasPrefix(err.Error(), "cannot access path: ") {
 		t.Errorf("List of a swapped directory: %v, want 500 with the reason", err)

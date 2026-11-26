@@ -115,7 +115,8 @@ Details:
   is `null`.
 - **Files** are read-only. Paths are canonicalised (`..` refused, symlinks resolved) and must stay under
   `/mnt/user`, `/mnt/user0`, `/mnt/disk<N>`, `/mnt/cache`, `/mnt/<pool>` (pools from `/boot/config/pools/*.cfg`)
-  or `/boot`; the opened descriptor is checked again. A name over 255 bytes or a path over 4095 bytes (3840 bytes
+  or `/boot`; the resolved path is then opened one component at a time without following any symlink, and the
+  opened descriptor is checked again. A name over 255 bytes or a path over 4095 bytes (3840 bytes
   under `/mnt/user` and `/mnt/user0`, where shfs rewrites the path to a longer disk or pool path) is refused
   with `400` before the filesystem is touched (an over-long name crashes Unraid's shfs). The same limits apply
   to symlink targets and to the path a link expands to, before anything below them is looked up: such a link is
