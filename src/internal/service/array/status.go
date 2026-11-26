@@ -97,6 +97,11 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 		synced, synced2 := parseInt("sbSynced"), parseInt("sbSynced2")
 		if synced > 0 && synced2 >= synced {
 			dur = synced2 - synced // idle: length of the last operation
+			// After a pause and resume sbSynced is the last resume; the
+			// history line has the whole operation without paused time.
+			if d, ok := LastLoggedDuration(synced2); ok {
+				dur = d
+			}
 		}
 		// For speed calc
 		dTime = parseInt("mdResyncDt")
@@ -195,7 +200,7 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 			// emhttpd moves sbSynced on resume; the first start is kept in
 			// stamps.ini (see parity_log.go), like the webGUI's elapsed time.
 			status.ParityCheckStatus.Duration = 0
-			if start := operationStart(synced); start > 0 {
+			if start := operationStart(synced, status.ParityCheckStatus.Paused); start > 0 {
 				if elapsed := nowFunc().Unix() - start; elapsed > 0 {
 					status.ParityCheckStatus.Duration = elapsed
 				}

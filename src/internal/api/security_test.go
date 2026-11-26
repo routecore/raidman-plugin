@@ -524,8 +524,10 @@ func TestSafeOriginClientProto(t *testing.T) {
 	}{
 		{"https://tower", "https", true},
 		{"http://tower", "https", false},
-		{"http://tower", "", true}, // LAN plain HTTP
-		{"http://tower", "http", true},
+		{"http://tower", "", true},     // see below: nginx https, no proxy -> refused
+		{"http://tower", "http", true}, // http:// proxy in front of https:// Unraid
+		{"http://tower", "http, https", true},
+		{"http://tower", "https, http", false},
 		{"https://tower", "", true},
 	}
 	for _, c := range cases {
@@ -534,6 +536,11 @@ func TestSafeOriginClientProto(t *testing.T) {
 		r.Header.Set("Origin", c.origin)
 		if c.proto != "" {
 			r.Header.Set("X-Raidman-Client-Proto", c.proto)
+		}
+		// nginx's own scheme is https (Unraid with SSL) in every case here.
+		r.Header.Set("X-Forwarded-Proto", "https")
+		if c.proto == "" && c.origin == "http://tower" {
+			c.want = false // no proxy in front: nginx's https decides
 		}
 		if got := isSafeOrigin(r); got != c.want {
 			t.Errorf("origin=%q proto=%q: got %v want %v", c.origin, c.proto, got, c.want)

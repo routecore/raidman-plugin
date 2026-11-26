@@ -143,6 +143,11 @@ func ParityAction(ctx context.Context, action string, correct bool) error {
 	default:
 		return badRequest("invalid parity action: %s", action)
 	}
+	// sbSynced before the command: emhttpd moves it to the resume time.
+	sbSynced := ""
+	if vars, err := emhttp.ReadIni(VarIniPath); err == nil {
+		sbSynced = vars["sbSynced"]
+	}
 	if action == "start" {
 		if err := DefaultParityLogger.beforeStart(); err != nil {
 			log.Printf("parity history before start: %v", err)
@@ -154,10 +159,6 @@ func ParityAction(ctx context.Context, action string, correct bool) error {
 	// Same bookkeeping as the webGUI's Pause/Resume buttons, so elapsed
 	// time and the history duration leave out the paused time.
 	if action == "pause" || action == "resume" {
-		sbSynced := ""
-		if vars, err := emhttp.ReadIni(VarIniPath); err == nil {
-			sbSynced = vars["sbSynced"]
-		}
 		if err := recordParityStamp(action == "pause", sbSynced); err != nil {
 			log.Printf("parity %s: could not record time stamp: %v", action, err)
 		}

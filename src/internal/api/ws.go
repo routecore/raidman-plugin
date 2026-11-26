@@ -337,12 +337,21 @@ func isSafeOrigin(r *http.Request) bool {
 	return originPort == port
 }
 
-// clientUsedHTTPS reports whether the browser reached nginx, or the proxy or
-// tunnel in front of it, over HTTPS (X-Raidman-Client-Proto is set by
-// raidman.conf).
+// clientUsedHTTPS reports whether the browser used HTTPS for the hop closest
+// to it. raidman.conf passes the X-Forwarded-Proto a proxy or tunnel in front
+// of nginx sent as X-Raidman-Client-Proto; when present it alone decides (an
+// http:// proxy in front of an https:// Unraid is a plain-HTTP client). Only
+// without it does nginx's own scheme (X-Forwarded-Proto, or TLS) count. A
+// browser page cannot set these headers on a WebSocket upgrade or a
+// sub-resource load, so a cross-site page cannot loosen the check.
 func clientUsedHTTPS(r *http.Request) bool {
-	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" ||
-		strings.EqualFold(r.Header.Get("X-Raidman-Client-Proto"), "https")
+	if p := strings.TrimSpace(r.Header.Get("X-Raidman-Client-Proto")); p != "" {
+		if i := strings.IndexByte(p, ','); i >= 0 {
+			p = strings.TrimSpace(p[:i]) // first proxy in a chain
+		}
+		return strings.EqualFold(p, "https")
+	}
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 }
 
 func defaultPort(scheme string) string {

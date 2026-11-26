@@ -134,3 +134,72 @@ func TestParityStartLogsAndClearsStamps(t *testing.T) {
 		t.Errorf("log = %q, want the cancelled check with 1050 s", b)
 	}
 }
+
+// Cancelled while paused after two pauses: paused time is counted from the
+// front (pause,resume pairs) plus the trailing pause up to the end.
+func TestParityHistoryTwoPausesCancelledWhilePaused(t *testing.T) {
+	withFixtures(t, "mdState=\"STARTED\"\nmdResync=\"0\"\nmdResyncPos=\"0\"\nsbSynced=\"1400\"\nsbSynced2=\"1700\"\nsbSyncExit=\"-4\"\nsbSyncErrs=\"0\"\nmdResyncAction=\"check P\"\nmdResyncSize=\"1000\"\n")
+	os.WriteFile(StampsPath, []byte("1000,1100,1400,1600"), 0o644)
+	var lg ParityLogger
+	if err := lg.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(ParityLogPath)
+	// 1700-1000 = 700 total, paused 300 (1100-1400) + 100 (1600-1700) = 400 -> 300.
+	if !strings.Contains(string(b), "|300|0|-4|0|check P|1000") {
+		t.Errorf("log = %q", b)
+	}
+	if d, ok := LastLoggedDuration(1700); !ok || d != 300 {
+		t.Errorf("LastLoggedDuration = %d %v", d, ok)
+	}
+	st, _ := GetArrayStatus()
+	if st.ParityCheckStatus.Duration != 300 {
+		t.Errorf("idle duration = %d, want 300 from the history line", st.ParityCheckStatus.Duration)
+	}
+}
+
+// A stamps.ini from an earlier operation is not used for a running one and is removed.
+func TestStaleStampsIgnored(t *testing.T) {
+	withFixtures(t, "mdState=\"STARTED\"\nmdResync=\"1000\"\nmdResyncPos=\"500\"\nmdResyncDt=\"30\"\nsbSynced=\"5000\"\nsbSynced2=\"0\"\nmdResyncSize=\"1000\"\nmdResyncAction=\"check P\"\n")
+	os.WriteFile(StampsPath, []byte("1000,1100,1400"), 0o644) // old check: resumed at 1400
+	os.WriteFile(ResyncPath, []byte("recon P,999"), 0o644)
+	withClock(t, 5100)
+	st, _ := GetArrayStatus()
+	if st.ParityCheckStatus.Duration != 100 {
+		t.Errorf("duration = %d, want 100 (not from the stale start)", st.ParityCheckStatus.Duration)
+	}
+	var lg ParityLogger
+	if err := lg.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(StampsPath); !os.IsNotExist(err) {
+		t.Errorf("stale stamps.ini kept")
+	}
+	if b, _ := os.ReadFile(ResyncPath); string(b) != "check P,1000" {
+		t.Errorf("resync.ini = %q", b)
+	}
+}
+
+// A line the webGUI wrote in another time zone is the same check: no new line.
+func TestParityLogOtherZoneNotDuplicated(t *testing.T) {
+	withFixtures(t, "mdState=\"STARTED\"\nmdResyncPos=\"0\"\nsbSynced=\"1795640000\"\nsbSynced2=\"1795644148\"\nsbSyncExit=\"0\"\nsbSyncErrs=\"0\"\n")
+	other := time.FixedZone("X", -5*3600-1800)
+	line := parityLogTimestamp(time.Unix(1795644148, 0).In(other)) + "|4148|0|0|0|check P|1\n"
+	// parityLogTimestamp converts to the local zone; build the foreign field by hand.
+	f := time.Unix(1795644148, 0).In(other).Format("2006.Jan.02 15:04:05")
+	f = strings.ReplaceAll(strings.ReplaceAll(f, ".0", "  "), ".", " ")
+	line = f + "|4148|0|0|0|check P|1\n"
+	os.WriteFile(ParityLogPath, []byte(line), 0o644)
+	var lg ParityLogger
+	for i := 0; i < 5; i++ {
+		if err := lg.Tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if b, _ := os.ReadFile(ParityLogPath); string(b) != line {
+		t.Errorf("log changed: %q", b)
+	}
+	if sameLoggedTime(f, 1795644148+60) {
+		t.Errorf("a different instant matched")
+	}
+}
