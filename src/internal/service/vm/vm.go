@@ -152,16 +152,39 @@ func lookupDomain(l *libvirt.Libvirt, ref string) (libvirt.Domain, error) {
 // ErrNotRunning is returned when a VM must be running for an operation.
 var ErrNotRunning = errors.New("VM is not running")
 
+// ErrWrongState marks an action the VM's current state does not allow (see
+// refusal).
+var ErrWrongState = errors.New("the VM's state does not allow this action")
+
+// stateError is an ErrWrongState with its message and, when libvirt refused
+// the call, libvirt's error.
+type stateError struct {
+	msg   string
+	cause error
+}
+
+func (e *stateError) Error() string { return e.msg }
+func (e *stateError) Unwrap() []error {
+	if e.cause == nil {
+		return []error{ErrWrongState}
+	}
+	return []error{ErrWrongState, e.cause}
+}
+
 // IsNotFound reports libvirt's "Domain not found" (an unknown name or UUID).
 func IsNotFound(err error) bool { return libvirt.IsNotFound(err) }
 
 // IsWrongState reports an action the VM's current state does not allow:
-// ErrNotRunning, or libvirt's "Requested operation is not valid" (starting a
-// running VM, stopping or resuming one that is not running or not paused).
+// ErrNotRunning or ErrWrongState, which are only returned after the
+// domain's state was read. libvirt's VIR_ERR_OPERATION_INVALID alone is not
+// enough: it also covers a passthrough device in use, an inactive network
+// and the like.
 func IsWrongState(err error) bool {
-	if errors.Is(err, ErrNotRunning) {
-		return true
-	}
+	return errors.Is(err, ErrNotRunning) || errors.Is(err, ErrWrongState)
+}
+
+// isOperationInvalid reports libvirt's "Requested operation is not valid".
+func isOperationInvalid(err error) bool {
 	var le libvirt.Error
 	return errors.As(err, &le) && libvirt.ErrorNumber(le.Code) == libvirt.ErrOperationInvalid
 }
@@ -475,28 +498,111 @@ func ExecuteVmAction(vmName string, action string) (err error) {
 	if err != nil {
 		return err
 	}
+	return runAction(l.Libvirt, dom, action)
+}
 
+// actionConn is the part of *libvirt.Libvirt that runAction uses (a fake
+// in tests).
+type actionConn interface {
+	resetConn
+	DomainShutdown(dom libvirt.Domain) error
+	DomainSuspend(dom libvirt.Domain) error
+	DomainResume(dom libvirt.Domain) error
+	DomainReboot(dom libvirt.Domain, flags libvirt.DomainRebootFlagValues) error
+	DomainPmSuspendForDuration(dom libvirt.Domain, target uint32, duration uint64, flags uint32) error
+}
+
+// active reports a state in which the domain has a running QEMU process.
+func active(st libvirt.DomainState) bool {
+	switch st {
+	case libvirt.DomainRunning, libvirt.DomainBlocked, libvirt.DomainPaused,
+		libvirt.DomainShutdown, libvirt.DomainCrashed, libvirt.DomainPmsuspended:
+		return true
+	}
+	return false
+}
+
+// refusal returns why the domain's state does not allow action, or "" when
+// it may be tried. Only the clear cases are refused (start of an active VM,
+// resume of one that is not paused, anything else on a shut-off VM, reset
+// as resetDomain decides); the rest is left to libvirt.
+func refusal(action string, st libvirt.DomainState) string {
 	switch action {
 	case "start":
-		return l.DomainCreate(dom)
-	case "stop":
-		return l.DomainShutdown(dom)
-	case "force-stop":
-		return l.DomainDestroy(dom)
-	case "pause":
-		return l.DomainSuspend(dom)
+		switch {
+		case st == libvirt.DomainRunning || st == libvirt.DomainBlocked:
+			return "VM is already running"
+		case active(st):
+			return "VM is already running (" + stateName(uint8(st)) + ")"
+		}
 	case "resume":
-		return l.DomainResume(dom)
+		switch st {
+		case libvirt.DomainPaused, libvirt.DomainCrashed, libvirt.DomainNostate:
+		default:
+			return "VM is not paused"
+		}
+	case "stop", "force-stop", "pause", "restart", "hibernate":
+		if st == libvirt.DomainShutoff {
+			return ErrNotRunning.Error()
+		}
+	case "reset": // as resetDomain
+		switch st {
+		case libvirt.DomainRunning, libvirt.DomainBlocked, libvirt.DomainPaused, libvirt.DomainCrashed:
+		default:
+			return ErrNotRunning.Error()
+		}
+	}
+	return ""
+}
+
+// runAction checks the domain's state, then runs the action. A state that
+// does not allow it answers ErrWrongState (409); so does libvirt's
+// "operation invalid" when the state, read again, no longer allows the
+// action (it changed meanwhile). Every other failure is returned as is
+// (500 with libvirt's message).
+func runAction(c actionConn, dom libvirt.Domain, action string) error {
+	if action == "reset" {
+		return resetDomain(c, dom) // checks the state itself
+	}
+	state, _, err := c.DomainGetState(dom, 0)
+	if err != nil {
+		return err
+	}
+	if msg := refusal(action, libvirt.DomainState(state)); msg != "" {
+		return &stateError{msg: msg}
+	}
+	switch action {
+	case "start":
+		err = c.DomainCreate(dom)
+	case "stop":
+		err = c.DomainShutdown(dom)
+	case "force-stop":
+		err = c.DomainDestroy(dom)
+	case "pause":
+		err = c.DomainSuspend(dom)
+	case "resume":
+		err = c.DomainResume(dom)
 	case "restart":
-		return l.DomainReboot(dom, 0) // 0 = Default
+		err = c.DomainReboot(dom, 0) // 0 = Default
 	case "hibernate":
-		// DomainPmSuspendForDuration
-		return l.DomainPmSuspendForDuration(dom, 1, 0, 0)
-	case "reset":
-		return resetDomain(l, dom)
+		err = c.DomainPmSuspendForDuration(dom, 1, 0, 0)
 	default:
 		return fmt.Errorf("invalid action: %s", action)
 	}
+	return stateChanged(c, dom, action, err)
+}
+
+// stateChanged turns libvirt's "operation invalid" into a stateError when
+// the domain's state, read again, does not allow action.
+func stateChanged(c resetConn, dom libvirt.Domain, action string, err error) error {
+	if err == nil || !isOperationInvalid(err) {
+		return err
+	}
+	state, _, serr := c.DomainGetState(dom, 0)
+	if serr == nil && refusal(action, libvirt.DomainState(state)) != "" {
+		return &stateError{msg: err.Error(), cause: err}
+	}
+	return err
 }
 
 // resetConn is the part of *libvirt.Libvirt that resetDomain uses (a fake
@@ -553,7 +659,7 @@ func resetDomain(c resetConn, dom libvirt.Domain) error {
 	}
 	err = c.DomainReset(dom, 0)
 	if err == nil || !isUnsupported(err) {
-		return err
+		return stateChanged(c, dom, "reset", err)
 	}
 	if st != libvirt.DomainRunning && st != libvirt.DomainBlocked {
 		return err

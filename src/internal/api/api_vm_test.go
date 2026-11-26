@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -80,7 +81,7 @@ func TestVmErrorStatuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	noDomain := libvirt.Error{Code: uint32(libvirt.ErrNoDomain), Message: "Domain not found: no domain with matching name 'ghost'"}
-	invalid := libvirt.Error{Code: uint32(libvirt.ErrOperationInvalid), Message: "Requested operation is not valid: domain is already running"}
+	invalid := libvirt.Error{Code: uint32(libvirt.ErrOperationInvalid), Message: "Requested operation is not valid: PCI device 0000:01:00.0 is in use"}
 	var next error
 	var autostart []bool
 	oldExec, oldInfo, oldAuto := executeVmAction, getVmInfo, setVmAutostart
@@ -105,10 +106,16 @@ func TestVmErrorStatuses(t *testing.T) {
 		}
 	}
 
-	next = invalid
+	next = fmt.Errorf("VM is already running: %w", vm.ErrWrongState)
 	code, body := doReq(t, h, "POST", "/api/vm/action", `{"vm":"Windows 11","action":"start"}`, keyAdmin)
 	if code != http.StatusConflict || json.Valid(body) || !strings.Contains(string(body), "already running") {
 		t.Errorf("start of a running VM: %d %q, want plain-text 409", code, body)
+	}
+	// libvirt's "operation invalid" alone (a passthrough device in use, an
+	// inactive network ...) is a failure, not a state conflict.
+	next = invalid
+	if code, body := doReq(t, h, "POST", "/api/vm/action", `{"vm":"Windows 11","action":"start"}`, keyAdmin); code != http.StatusInternalServerError || !strings.Contains(string(body), "in use") {
+		t.Errorf("operation invalid without a state conflict: %d %q, want 500 with libvirt's message", code, body)
 	}
 	next = errors.New("libvirt exploded")
 	if code, _ := doReq(t, h, "POST", "/api/vm/action", `{"vm":"Windows 11","action":"start"}`, keyAdmin); code != http.StatusInternalServerError {

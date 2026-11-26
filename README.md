@@ -171,12 +171,16 @@ Details:
 
 | Route | Permission | Change |
 |---|---|---|
-| `POST /api/vm/action` | `VMS:UPDATE_ANY` | new action `reset` (feature `vm.reset`); unknown actions → `400`; an action the VM's state does not allow (`reset` or `stop` of a VM that is not running, `start` of a running one, `resume` of one that is not paused) → `409` |
+| `POST /api/vm/action` | `VMS:UPDATE_ANY` | new action `reset` (feature `vm.reset`); unknown actions → `400`; an action the VM's state does not allow (`start` of a running, paused or otherwise active VM; `resume` of one that is not paused; `stop`, `force-stop`, `restart`, `pause`, `hibernate` or `reset` of a shut-off one; `reset` of one shutting down or suspended) → `409`, decided from the VM's state, read before the action and again if libvirt refuses it; any other failure → `500` with libvirt's message |
 | `GET /api/vm/info`, `GET /api/vms` | `VMS:READ_ANY` | `interfaces[].ipAddresses` (feature `vm.ips`), `hostdevs[]` (feature `vm.hostdevs`), `detailedState` `blocked` / `shutdown` |
 | `POST /api/vm/autostart` | `VMS:UPDATE_ANY` | `enabled` is required (`400` without it; older plugins turned autostart off) |
 
 An unknown VM on `/api/vm/action`, `/api/vm/autostart` or `/api/vm/info` answers `422` `{"error","code":"not_found"}`
-(older plugins: plain-text `500`). `409` bodies stay plain text (libvirt's message).
+(older plugins: plain-text `500`). `409` bodies stay plain text: a short reason (`VM is already running`, `VM is not
+running`, `VM is not paused`) or, when the state changed while libvirt ran the action, libvirt's message. libvirt's
+"Requested operation is not valid" alone is not a state conflict (it also means a passthrough device in use, an
+inactive network, ...): it answers `500` with libvirt's message, on `/api/vm/autostart` too. A failed force-stop and
+start of the `reset` fallback is a `500`.
 
 ### Docker actions (protocol-1 route)
 
