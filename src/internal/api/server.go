@@ -35,7 +35,7 @@ type Api struct {
 	server     *http.Server
 
 	// execCleanups counts container console sessions whose cleanup (see
-	// endExecSession) has not finished.
+	// execWatch.end in exec_cleanup.go) has not finished.
 	execCleanups atomic.Int64
 }
 
