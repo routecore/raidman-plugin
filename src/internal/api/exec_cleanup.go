@@ -47,8 +47,11 @@ const execTagEnv = "RAIDMAN_EXEC"
 var (
 	procRoot      = "/proc"
 	signalProcess = func(pid int, sig syscall.Signal) error { return syscall.Kill(pid, sig) }
-	// openPidfd opens a pidfd (Linux); signals then go through it.
-	openPidfd = pidfdOpen
+	// openPidfd opens a pidfd (Linux); signals then go through it
+	// (sendPidfdSignal) and it is closed with closePidfd.
+	openPidfd       = pidfdOpen
+	sendPidfdSignal = pidfdSignal
+	closePidfd      = pidfdClose
 	// readProcFile reads one /proc file. A read can block for good (a
 	// process in D state, e.g. on a hung NFS mount, holds its memory map
 	// lock, which reading environ needs), so it runs with execReadTimeout.
@@ -265,7 +268,7 @@ func (s *execSession) handle(p procInfo) *procHandle {
 
 func (h *procHandle) close() {
 	if h.fd >= 0 {
-		pidfdClose(h.fd)
+		closePidfd(h.fd)
 		h.fd = -1
 	}
 }
@@ -276,7 +279,7 @@ func (s *execSession) signal(h *procHandle, sig syscall.Signal) {
 		return
 	}
 	if h.fd >= 0 {
-		_ = pidfdSignal(h.fd, sig)
+		_ = sendPidfdSignal(h.fd, sig)
 		return
 	}
 	_ = signalProcess(h.pid, sig)

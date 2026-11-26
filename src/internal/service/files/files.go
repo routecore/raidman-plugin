@@ -597,13 +597,20 @@ func ListContext(ctx context.Context, raw string, opt ListOptions) (Listing, err
 	for _, b := range bases(BootDir) {
 		inBoot = inBoot || under(p, b)
 	}
+	userRoots := userShareRoots()
 	for _, it := range page {
 		de := it.de
+		full := filepath.Join(p, de.Name())
+		if checkPathLength(full, userRoots) != nil {
+			// Too long to look up (de.Info is an lstat; see
+			// maxUserPathLen): listed by name and type only.
+			out.Entries = append(out.Entries, Entry{Name: de.Name(), Path: full, Type: entryType(de.Type())})
+			continue
+		}
 		info, err := de.Info()
 		if err != nil {
 			continue // removed meanwhile
 		}
-		full := filepath.Join(p, de.Name())
 		e := Entry{Name: de.Name(), Path: full, Type: entryType(info.Mode()), Mtime: info.ModTime().Unix()}
 		if inBoot && e.Type != "symlink" {
 			if !deniedLoaded {

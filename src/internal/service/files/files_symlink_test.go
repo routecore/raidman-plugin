@@ -230,3 +230,37 @@ func TestOpenErrorsMatchREADME(t *testing.T) {
 	wantOpen(t, share+"/secret.txt", http.StatusForbidden)
 	wantList(t, share+"/esc", http.StatusForbidden)
 }
+
+// checkPathLength is what guards every lookup, including the lstat of each
+// listed entry (a directory just under the cap holding a long name).
+func TestCheckPathLength(t *testing.T) {
+	roots := []string{"/mnt/user", "/mnt/user0", "/r/mnt/user", "/r/mnt/user0"}
+	at := func(dir string, n int) string { // dir + "/" + n-len(dir)-1 bytes in 200-byte names
+		p := dir
+		for len(p)+201 <= n {
+			p += "/" + strings.Repeat("d", 200)
+		}
+		if k := n - len(p) - 1; k > 0 {
+			p += "/" + strings.Repeat("e", k)
+		}
+		return p
+	}
+	for _, c := range []struct {
+		path string
+		ok   bool
+	}{
+		{at("/mnt/user/share", maxUserPathLen), true},
+		{at("/mnt/user/share", maxUserPathLen+1), false},
+		{at("/mnt/user0", maxUserPathLen+1), false},
+		{at("/r/mnt/user/s", maxUserPathLen+1), false}, // the resolved form of MntDir
+		{at("/mnt/users", maxUserPathLen+1), true},     // not a user share
+		{at("/mnt/disk1", maxPathLen), true},
+		{at("/mnt/disk1", maxPathLen+1), false},
+		{"/mnt/disk1/" + strings.Repeat("n", maxNameLen), true},
+		{"/mnt/disk1/" + strings.Repeat("n", maxNameLen+1), false},
+	} {
+		if err := checkPathLength(c.path, roots); (err == nil) != c.ok {
+			t.Errorf("%.30s... (%d bytes): %v, want ok=%v", c.path, len(c.path), err, c.ok)
+		}
+	}
+}

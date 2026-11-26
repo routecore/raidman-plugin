@@ -557,8 +557,8 @@ func refusal(action string, st libvirt.DomainState) string {
 
 // runAction checks the domain's state, then runs the action. A state that
 // does not allow it answers ErrWrongState (409); so does libvirt's
-// "operation invalid" when the state, read again, no longer allows the
-// action (it changed meanwhile). Every other failure is returned as is
+// "operation invalid" when the state, read again, is not the one the action
+// is meant for (see stateChanged). Every other failure is returned as is
 // (500 with libvirt's message).
 func runAction(c actionConn, dom libvirt.Domain, action string) error {
 	if action == "reset" {
@@ -592,14 +592,37 @@ func runAction(c actionConn, dom libvirt.Domain, action string) error {
 	return stateChanged(c, dom, action, err)
 }
 
+// usualState reports whether st is a state action is meant for: start a
+// shut-off VM, stop/restart/pause/hibernate a running one, resume a paused
+// one, force-stop an active one, reset a running or paused one.
+func usualState(action string, st libvirt.DomainState) bool {
+	running := st == libvirt.DomainRunning || st == libvirt.DomainBlocked
+	switch action {
+	case "start":
+		return st == libvirt.DomainShutoff
+	case "stop", "restart", "pause", "hibernate":
+		return running
+	case "resume":
+		return st == libvirt.DomainPaused
+	case "force-stop":
+		return active(st)
+	case "reset":
+		return running || st == libvirt.DomainPaused
+	}
+	return true
+}
+
 // stateChanged turns libvirt's "operation invalid" into a stateError when
-// the domain's state, read again, does not allow action.
+// the domain's state, read again, is not one the action is meant for (a VM
+// that is paused, stopped meanwhile, ...). In its usual state the refusal
+// has another cause (a passthrough device in use, an inactive network) and
+// err is returned as is.
 func stateChanged(c resetConn, dom libvirt.Domain, action string, err error) error {
 	if err == nil || !isOperationInvalid(err) {
 		return err
 	}
 	state, _, serr := c.DomainGetState(dom, 0)
-	if serr == nil && refusal(action, libvirt.DomainState(state)) != "" {
+	if serr == nil && !usualState(action, libvirt.DomainState(state)) {
 		return &stateError{msg: err.Error(), cause: err}
 	}
 	return err

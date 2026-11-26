@@ -240,7 +240,13 @@ func TestRunAction(t *testing.T) {
 		// "Operation invalid" for something other than the state: 500 with
 		// libvirt's message (the state still allows the action).
 		{"start", fakeResetConn{state: libvirt.DomainShutoff, createErr: hostdev}, []string{"state", "create", "state"}, fail, "in use"},
-		{"stop", fakeResetConn{state: libvirt.DomainPaused, actionErr: invalid}, []string{"state", "shutdown", "state"}, fail, "domain is not running"},
+		{"stop", fakeResetConn{state: libvirt.DomainRunning, actionErr: hostdev}, []string{"state", "shutdown", "state"}, fail, "in use"},
+		// libvirt refuses in a state the action is not meant for: 409.
+		{"stop", fakeResetConn{state: libvirt.DomainPaused, actionErr: invalid}, []string{"state", "shutdown", "state"}, conflict, "domain is not running"},
+		{"pause", fakeResetConn{state: libvirt.DomainPaused, actionErr: invalid}, []string{"state", "suspend", "state"}, conflict, "domain is not running"},
+		{"restart", fakeResetConn{state: libvirt.DomainPmsuspended, actionErr: invalid}, []string{"state", "reboot", "state"}, conflict, "domain is not running"},
+		{"resume", fakeResetConn{state: libvirt.DomainCrashed, actionErr: invalid}, []string{"state", "resume", "state"}, conflict, "domain is not running"},
+		{"resume", fakeResetConn{state: libvirt.DomainPaused, actionErr: hostdev}, []string{"state", "resume", "state"}, fail, "in use"},
 		// The state changed after the check: 409.
 		{"stop", fakeResetConn{state: libvirt.DomainRunning, stateAfter: libvirt.DomainShutoff, actionErr: invalid}, []string{"state", "shutdown", "state"}, conflict, "domain is not running"},
 		{"start", fakeResetConn{state: libvirt.DomainShutoff, stateAfter: libvirt.DomainRunning, createErr: invalid}, []string{"state", "create", "state"}, conflict, "not valid"},

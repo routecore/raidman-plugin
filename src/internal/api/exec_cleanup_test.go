@@ -34,9 +34,11 @@ func newFakeProc(t *testing.T) *fakeProc {
 	t.Helper()
 	fp := &fakeProc{t: t, root: t.TempDir()}
 	oldRoot, oldSig, oldPidfd, oldRead, oldID := procRoot, signalProcess, openPidfd, readProcFile, containerFullID
+	oldPidfdSig, oldPidfdClose := sendPidfdSignal, closePidfd
 	oldGrace, oldPoll, oldLate, oldRT, oldCT := execHupGrace, execPollEvery, execLateStart, execReadTimeout, execCleanupTimeout
 	t.Cleanup(func() {
 		procRoot, signalProcess, openPidfd, readProcFile, containerFullID = oldRoot, oldSig, oldPidfd, oldRead, oldID
+		sendPidfdSignal, closePidfd = oldPidfdSig, oldPidfdClose
 		execHupGrace, execPollEvery, execLateStart, execReadTimeout, execCleanupTimeout = oldGrace, oldPoll, oldLate, oldRT, oldCT
 	})
 	procRoot = fp.root
@@ -45,6 +47,11 @@ func newFakeProc(t *testing.T) *fakeProc {
 		return nil
 	}
 	openPidfd = func(int) (int, error) { return -1, errors.ErrUnsupported }
+	sendPidfdSignal = func(fd int, sig syscall.Signal) error {
+		t.Errorf("unexpected signal %v through fd %d", sig, fd)
+		return nil
+	}
+	closePidfd = func(int) {}
 	containerFullID = func(context.Context, string) (string, error) { return ctrID, nil }
 	execHupGrace, execPollEvery, execLateStart = 300*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond
 	execReadTimeout, execCleanupTimeout = 200*time.Millisecond, 10*time.Second
@@ -384,5 +391,67 @@ func TestEndExecSessionDeadline(t *testing.T) {
 	endExecSession("plex", ctrID, testTag, closedChan())
 	if hup, kill := signals(); len(hup)+len(kill) != 0 {
 		t.Errorf("signals after the deadline: SIGHUP %v, SIGKILL %v", hup, kill)
+	}
+}
+
+// With pidfds (Linux), signals go through the descriptor opened during the
+// scan, never by pid; a pid whose start time changed between the scan and
+// the open (reused) gets no signal; every descriptor is closed.
+func TestEndExecSessionPidfds(t *testing.T) {
+	fp := newFakeProc(t)
+	mark := execTagEnv + "=" + testTag
+	fp.add(fproc{pid: 500, comm: "sh", pgid: 500, sid: 500, tpgid: 510, start: "1", ctr: ctrID, env: []string{mark}})
+	fp.add(fproc{pid: 510, comm: "top", pgid: 510, sid: 500, tpgid: 510, start: "2", ctr: ctrID})
+	fp.add(fproc{pid: 520, comm: "bg", pgid: 520, sid: 500, start: "3", ctr: ctrID})
+	var mu sync.Mutex
+	open := map[int]int{} // fd -> pid
+	opened, closed := 0, 0
+	openPidfd = func(pid int) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if pid == 520 {
+			// Exits and its pid is reused between the scan and the open.
+			fp.add(fproc{pid: 520, comm: "reused", pgid: 520, sid: 500, start: "99", ctr: ctrID})
+		}
+		opened++
+		open[1000+opened] = pid
+		return 1000 + opened, nil
+	}
+	closePidfd = func(fd int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := open[fd]; !ok {
+			t.Errorf("closed fd %d twice or never opened", fd)
+		}
+		delete(open, fd)
+		closed++
+	}
+	var got []sent
+	sendPidfdSignal = func(fd int, sig syscall.Signal) error {
+		mu.Lock()
+		pid := open[fd]
+		got = append(got, sent{pid, sig})
+		mu.Unlock()
+		if sig == syscall.SIGHUP && pid == 510 {
+			fp.remove(510)
+		}
+		return nil
+	}
+	endExecSession("plex", ctrID, testTag, closedChan())
+	// 500 ignores the hang-up and is killed; 520's first handle was
+	// dropped (start time changed), the process now holding the pid is in
+	// the session and killed through its own handle.
+	want := []sent{{500, syscall.SIGHUP}, {510, syscall.SIGHUP}, {500, syscall.SIGKILL}, {520, syscall.SIGKILL}}
+	sort.Slice(got, func(i, j int) bool {
+		if got[i].sig != got[j].sig {
+			return got[i].sig < got[j].sig
+		}
+		return got[i].pid < got[j].pid
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("signals %v, want %v", got, want)
+	}
+	if len(open) != 0 || opened != closed {
+		t.Errorf("opened %d, closed %d, still open %v", opened, closed, open)
 	}
 }

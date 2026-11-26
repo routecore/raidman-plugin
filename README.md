@@ -119,7 +119,8 @@ Details:
   under `/mnt/user` and `/mnt/user0`, where shfs rewrites the path to a longer disk or pool path) is refused
   with `400` before the filesystem is touched (an over-long name crashes Unraid's shfs). The same limits apply
   to symlink targets and to the path a link expands to, before anything below them is looked up: such a link is
-  refused with `400` when opened and listed without `targetType`. More than 40 links in one path answer `500`
+  refused with `400` when opened and listed without `targetType`; a listed entry whose full path would exceed the
+  limit is listed by name and type only (no size or `mtime`). More than 40 links in one path answer `500`
   (`too many levels of symbolic links`). Errors never echo the path; `403` is only a policy refusal (outside the
   roots, a protected file) or a permission error, and any other filesystem failure answers `500` with the
   system's reason only (e.g. `transport endpoint is not connected`, or a path swapped for a symlink while it
@@ -171,7 +172,7 @@ Details:
 
 | Route | Permission | Change |
 |---|---|---|
-| `POST /api/vm/action` | `VMS:UPDATE_ANY` | new action `reset` (feature `vm.reset`); unknown actions → `400`; an action the VM's state does not allow (`start` of a running, paused or otherwise active VM; `resume` of one that is not paused; `stop`, `force-stop`, `restart`, `pause`, `hibernate` or `reset` of a shut-off one; `reset` of one shutting down or suspended) → `409`, decided from the VM's state, read before the action and again if libvirt refuses it; any other failure → `500` with libvirt's message |
+| `POST /api/vm/action` | `VMS:UPDATE_ANY` | new action `reset` (feature `vm.reset`); unknown actions → `400`; an action the VM's state does not allow (`start` of a running, paused or otherwise active VM; `resume` of one that is not paused; `stop`, `force-stop`, `restart`, `pause`, `hibernate` or `reset` of a shut-off one; `reset` of one shutting down or suspended) → `409`, decided from the VM's state, read before the action and again if libvirt refuses it (a refusal while the VM is not in the state the action is meant for, e.g. `stop` or `pause` of a paused VM, is also `409`); any other failure → `500` with libvirt's message |
 | `GET /api/vm/info`, `GET /api/vms` | `VMS:READ_ANY` | `interfaces[].ipAddresses` (feature `vm.ips`), `hostdevs[]` (feature `vm.hostdevs`), `detailedState` `blocked` / `shutdown` |
 | `POST /api/vm/autostart` | `VMS:UPDATE_ANY` | `enabled` is required (`400` without it; older plugins turned autostart off) |
 
