@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +33,10 @@ type Api struct {
 	baseCtx    context.Context
 	cancelBase context.CancelFunc
 	server     *http.Server
+
+	// execCleanups counts container console sessions whose cleanup (see
+	// endExecSession) has not finished.
+	execCleanups atomic.Int64
 }
 
 // Create builds the API server around a key store.
@@ -117,11 +122,26 @@ func (a *Api) Run() error {
 }
 
 // Shutdown stops accepting requests, closes open streams and waits briefly
-// for in-flight requests.
+// for in-flight requests and for container console cleanups, so stopping
+// the plugin still ends the shells it started in containers.
 func (a *Api) Shutdown(ctx context.Context) error {
 	a.cancelBase()
-	if a.server == nil {
-		return nil
+	var err error
+	if a.server != nil {
+		err = a.server.Shutdown(ctx)
 	}
-	return a.server.Shutdown(ctx)
+	a.waitExecCleanups(ctx)
+	return err
+}
+
+// waitExecCleanups waits until no container console cleanup is pending, or
+// ctx ends.
+func (a *Api) waitExecCleanups(ctx context.Context) {
+	for a.execCleanups.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }

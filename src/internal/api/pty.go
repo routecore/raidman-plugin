@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -41,8 +42,9 @@ func ptyStream(termType string) func(a *Api, ws *wsConn, r *http.Request, k *aut
 // buildPtyCommand validates the request and builds the command for a PTY
 // stream. User-supplied values only ever appear as single argv entries after
 // validation (and after "--" where the tool supports it); nothing goes
-// through a shell. onEnd, when not nil, runs once the session has ended.
-func (a *Api) buildPtyCommand(termType string, r *http.Request) (cmd *exec.Cmd, errMsg string, onEnd func()) {
+// through a shell. onEnd, when not nil, runs on its own goroutine once the
+// session has ended; cliExited is closed when the command has exited.
+func (a *Api) buildPtyCommand(termType string, r *http.Request) (cmd *exec.Cmd, errMsg string, onEnd func(cliExited <-chan struct{})) {
 	q := r.URL.Query()
 	termEnv := append(os.Environ(), "TERM=xterm-256color")
 	switch termType {
@@ -80,9 +82,15 @@ func (a *Api) buildPtyCommand(termType string, r *http.Request) (cmd *exec.Cmd, 
 			if err != nil {
 				return nil, "Error: " + err.Error(), nil
 			}
+			// The container's full id ties the cleanup to its processes.
+			// Unknown here (a missing container: the CLI says so), it is
+			// looked up again at the end.
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			fullID, _ := containerFullID(ctx, id)
+			cancel()
 			cmd := exec.Command("docker", "exec", "-it", "-e", execTagEnv+"="+tag, "--", id, shell)
 			cmd.Env = termEnv
-			return cmd, "", func() { endExecSession(tag) }
+			return cmd, "", func(cliExited <-chan struct{}) { endExecSession(id, fullID, tag, cliExited) }
 		}
 		return exec.Command("docker", "logs", "-f", "--tail", "100", "--", id), "", nil
 
@@ -164,6 +172,11 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 		return
 	}
 	log.Printf("[AUDIT] Starting PTY session %q by key %s from %q", termType, k.Label(), truncate(clientIP(r), 64))
+	if onEnd != nil {
+		// Counted from here so Shutdown waits for the cleanup (see
+		// waitExecCleanups).
+		a.execCleanups.Add(1)
+	}
 
 	// pty.Start runs the child with Setsid, so it leads its own process
 	// group and the whole group can be signalled on close. The terminal
@@ -172,6 +185,9 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 	// before the first resize would otherwise misrender.
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: defaultCols, Rows: defaultRows})
 	if err != nil {
+		if onEnd != nil {
+			a.execCleanups.Add(-1)
+		}
 		_ = ws.WriteText("Error starting pty: " + err.Error())
 		ws.drain()
 		ws.closeWith(websocket.CloseNormalClosure, "Error starting pty")
@@ -189,13 +205,19 @@ func (a *Api) handlePty(ws *wsConn, termType string, r *http.Request, k *auth.Ke
 		close(stop)
 		watcher.Wait()
 		_ = master.Close()
-		// End what the session started inside the container first: the
-		// docker CLI then exits on its own, and killing the CLI alone
-		// would leave the container's processes running.
+		// Killing the docker CLI alone would leave the container's
+		// processes running, so onEnd ends them, on its own goroutine:
+		// it reads /proc and may block on a stuck process, and must
+		// never keep the CLI alive or the stream slot held.
+		cliExited := make(chan struct{})
 		if onEnd != nil {
-			onEnd()
+			go func() {
+				defer a.execCleanups.Add(-1)
+				onEnd(cliExited)
+			}()
 		}
 		terminateGroup(cmd)
+		close(cliExited)
 		log.Printf("[AUDIT] PTY session %q by key %s ended", termType, k.Label())
 		// The process ended on its own (exit, logs of a stopped
 		// container, ...): tell the client with a clean close instead of

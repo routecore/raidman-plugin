@@ -35,6 +35,8 @@ Role expansion matches the Unraid API policy:
 
 A shell in a container usually runs as root, and privileged containers or a mounted `docker.sock` reach the host; the VM serial console is a login prompt on the guest. Like the Unraid API, where `DOCKER: UPDATE_ANY` and `VMS: UPDATE_ANY` never include a shell, both require the `ADMIN` role.
 
+Closing a container console (or losing its connection) ends it like an ssh disconnect: its shell and the terminal's foreground job are hung up, and after 3 seconds whatever is still in the shell's session is killed, except processes that ignore `SIGHUP`. Work the user detached on purpose (`nohup`, `setsid`, a `tmux`/`screen` server) keeps running in the container. Only processes in that container's cgroup are inspected or signalled, and on Linux they are signalled through pidfds, so a reused pid is never hit.
+
 Container environment variables (which often hold secrets) are removed from the container list unless the key has `DOCKER: UPDATE_ANY` and the request explicitly asks for them.
 
 > [!IMPORTANT]

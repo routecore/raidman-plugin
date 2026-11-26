@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"os"
@@ -112,8 +113,8 @@ func TestDockerExecCloseEndsContainerSession(t *testing.T) {
 	if m == nil {
 		t.Fatalf("docker args %q", b)
 	}
-	fp.add(4242, "sh", "S", 4242, 4242, "1", "PATH=/bin", m[1])
-	fp.add(4243, "sh", "S", 4243, 4243, "1", "PATH=/bin", "RAIDMAN_EXEC=00000000000000000000000000000000")
+	fp.add(fproc{pid: 4242, comm: "sh", pgid: 4242, sid: 4242, start: "1", ctr: ctrID, env: []string{"PATH=/bin", m[1]}})
+	fp.add(fproc{pid: 4243, comm: "sh", pgid: 4243, sid: 4243, start: "1", ctr: ctrID, env: []string{"PATH=/bin", "RAIDMAN_EXEC=00000000000000000000000000000000"}})
 
 	_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	deadline := time.Now().Add(hangupGrace + 5*time.Second)
@@ -137,6 +138,70 @@ func TestDockerExecCloseEndsContainerSession(t *testing.T) {
 			t.Fatal("stream slot still held")
 		}
 	}
+	waitCleanups(t, a)
+}
+
+// waitCleanups waits for the console cleanups still running (they use the
+// hooks newFakeProc restores).
+func waitCleanups(t *testing.T, a *Api) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a.waitExecCleanups(ctx)
+	if n := a.execCleanups.Load(); n != 0 {
+		t.Fatalf("%d console cleanup(s) still running", n)
+	}
+}
+
+// A cleanup stuck reading /proc (a process in D state) does not hold the
+// docker CLI, the stream slot or the audit line: they no longer wait for it.
+func TestDockerExecStuckCleanupReleasesSlot(t *testing.T) {
+	a, _ := newTestApi(t)
+	base := ptyTestServer(t, a)
+	bin := t.TempDir()
+	script := "#!/bin/sh\necho ready\nexec sleep 60\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	fp := newFakeProc(t)
+	fp.add(fproc{pid: 4242, comm: "sh", pgid: 4242, sid: 4242, start: "1", ctr: ctrID})
+	block := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+	readProcFile = func(p string) ([]byte, error) {
+		if strings.HasSuffix(p, "/environ") {
+			<-block
+		}
+		return os.ReadFile(p)
+	}
+	execReadTimeout = time.Hour // only the goroutine bounds the wait now
+
+	c, _, err := websocket.DefaultDialer.Dial(base+"docker&container=plex", http.Header{"x-api-key": {keyAdmin}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, msg, err := c.ReadMessage(); err != nil || !strings.Contains(string(msg), "ready") {
+		t.Fatalf("first frame: %v %q", err, msg)
+	}
+	if n := a.execCleanups.Load(); n != 1 {
+		t.Fatalf("pending cleanups = %d, want 1", n)
+	}
+	c.UnderlyingConn().Close()
+	for deadline := time.Now().Add(hangupGrace + 3*time.Second); openStreams(a) != 0; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("stream slot held by a stuck cleanup")
+		}
+	}
+	if n := a.execCleanups.Load(); n != 1 {
+		t.Errorf("pending cleanups = %d, want the stuck one", n)
+	}
+	unblock()
+	waitCleanups(t, a)
 }
 
 // vm-log for a VM libvirt does not know and that has no log is refused with

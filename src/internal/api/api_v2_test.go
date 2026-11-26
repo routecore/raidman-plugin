@@ -388,6 +388,9 @@ var execTagRe = regexp.MustCompile(`^RAIDMAN_EXEC=[0-9a-f]{32}$`)
 
 func TestDockerExecShellParam(t *testing.T) {
 	a, _ := newTestApi(t)
+	orig := containerFullID
+	t.Cleanup(func() { containerFullID = orig })
+	containerFullID = func(context.Context, string) (string, error) { return ctrID, nil }
 	tags := map[string]bool{}
 	build := func(q string) ([]string, string) {
 		r := httptest.NewRequest("GET", "/connect?type=docker&"+q, nil)

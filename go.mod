@@ -11,6 +11,7 @@ require (
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // upstream main: fixes GO-2026-6278 (no tagged release yet)
 	github.com/moby/moby/api v1.57.0
 	github.com/moby/moby/client v0.6.3
+	golang.org/x/sys v0.41.0
 	libvirt.org/go/libvirtxml v1.12008.0
 )
 
@@ -33,7 +34,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect; kept in step with otel (GO-2026-5506, GO-2026-6974)
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.49.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
 )
 
 require go.opentelemetry.io/otel/log v1.47.0 // indirect

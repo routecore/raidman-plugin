@@ -180,6 +180,32 @@ func rawInspect(ctx context.Context, cli *client.Client, id string) ([]byte, err
 	return body, nil
 }
 
+// fullIDRe is a container's full id.
+var fullIDRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// ContainerFullID returns the full (64 hex) id of a container given by id,
+// id prefix or name.
+func ContainerFullID(ctx context.Context, ref string) (string, error) {
+	cli, err := getDockerClient()
+	if err != nil {
+		return "", err
+	}
+	body, err := rawInspect(ctx, cli, ref)
+	if err != nil {
+		return "", err
+	}
+	var v struct {
+		ID string `json:"Id"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return "", err
+	}
+	if !fullIDRe.MatchString(v.ID) {
+		return "", fmt.Errorf("inspect %s: unexpected id", ref)
+	}
+	return v.ID, nil
+}
+
 // maxInspectBytes bounds one inspect document (normally a few KiB).
 const maxInspectBytes = 8 << 20
 
