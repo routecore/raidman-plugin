@@ -106,3 +106,45 @@ func TestCalculateSpeedsIgnoresUnknownDevicesAndZeroDelta(t *testing.T) {
 		t.Fatal("zero delta must not compute a speed")
 	}
 }
+
+// Every internal boot device gets a speed, not only the one picked as Boot.
+// Before dedicated boot pools were dropped from Caches, their slots got
+// speeds there; BootDevices must keep that.
+func TestCalculateSpeedsBootDevices(t *testing.T) {
+	dev := func(name string, rb, wb int64) domain.ArrayDisk {
+		return domain.ArrayDisk{Id: name, Name: name, Type: "Boot", ReadBytes: rb, WriteBytes: wb}
+	}
+	prevBoot := dev("boot", 1000, 1000)
+	currBoot := dev("boot", 3000, 5000)
+	prev := domain.ArrayStatus{
+		Boot:        &prevBoot,
+		BootDevices: []domain.ArrayDisk{dev("boot", 1000, 1000), dev("boot2", 100, 100)},
+	}
+	curr := domain.ArrayStatus{
+		Boot:        &currBoot,
+		BootDevices: []domain.ArrayDisk{dev("boot", 3000, 5000), dev("boot2", 900, 300), dev("boot3", 50, 50)},
+	}
+	CalculateSpeeds(&curr, &prev, 2)
+
+	if curr.Boot.ReadSpeed != 1000 || curr.Boot.WriteSpeed != 2000 {
+		t.Fatalf("Boot: read=%v write=%v", curr.Boot.ReadSpeed, curr.Boot.WriteSpeed)
+	}
+	want := []struct{ r, w float64 }{{1000, 2000}, {400, 100}, {0, 0}}
+	for i, w := range want {
+		d := curr.BootDevices[i]
+		if d.ReadSpeed != w.r || d.WriteSpeed != w.w {
+			t.Fatalf("BootDevices[%d] %s: read=%v write=%v, want %v/%v", i, d.Name, d.ReadSpeed, d.WriteSpeed, w.r, w.w)
+		}
+	}
+
+	// Boot picked from boot2: the Boot "boot" key must not leak into the
+	// BootDevices entry named "boot".
+	prevB2 := dev("boot2", 0, 0)
+	currB2 := dev("boot2", 0, 0)
+	prev = domain.ArrayStatus{Boot: &prevB2, BootDevices: []domain.ArrayDisk{dev("boot", 10, 10), dev("boot2", 0, 0)}}
+	curr = domain.ArrayStatus{Boot: &currB2, BootDevices: []domain.ArrayDisk{dev("boot", 30, 10), dev("boot2", 0, 0)}}
+	CalculateSpeeds(&curr, &prev, 2)
+	if curr.BootDevices[0].ReadSpeed != 10 || curr.BootDevices[0].WriteSpeed != 0 {
+		t.Fatalf("BootDevices[0] keyed wrongly: %+v", curr.BootDevices[0])
+	}
+}

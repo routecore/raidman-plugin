@@ -702,4 +702,25 @@ func CalculateSpeeds(curr *domain.ArrayStatus, prev *domain.ArrayStatus, deltaSe
 			apply(curr.Boot, p)
 		}
 	}
+
+	// BootDevices get their own map: slot names ("boot", "boot2", "flash")
+	// must not collide with the fixed "boot" key used for Boot above.
+	prevBoot := make(map[string]domain.ArrayDisk, len(prev.BootDevices))
+	for _, d := range prev.BootDevices {
+		key := d.Name
+		if key == "" {
+			key = d.Id
+		}
+		prevBoot[key] = d
+	}
+	for i := range curr.BootDevices {
+		d := &curr.BootDevices[i]
+		key := d.Name
+		if key == "" {
+			key = d.Id
+		}
+		if p, ok := prevBoot[key]; ok {
+			apply(d, p)
+		}
+	}
 }
