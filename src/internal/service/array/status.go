@@ -265,6 +265,7 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 	disksMap, err := parseIniSections(disksIniPath)
 	var bootSlots, flashSlots []domain.ArrayDisk
 	if err == nil {
+		bootModes := bootPoolModes(disksMap)
 		for _, section := range sortedSections(disksMap) {
 			data := disksMap[section]
 			if len(data) == 0 {
@@ -336,6 +337,12 @@ func getArrayStatusWithPaths(varIniPath, disksIniPath, devsIniPath string) (*dom
 					status.Disks = append(status.Disks, d)
 				}
 			case "Cache":
+				// A dedicated internal boot pool (7.3+) is not a pool: the
+				// webGUI shows it only as internal boot, which BootDevices
+				// already carries. Hybrid ("yes") pools stay listed.
+				if isDedicatedBootPoolSlot(bootModes, poolSlotName(section, data)) {
+					continue
+				}
 				if d.Device != "" && d.State != "DISK_NP" {
 					status.Caches = append(status.Caches, d)
 				}
