@@ -3,15 +3,21 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/docker/go-units"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/client"
 )
 
 type ContainerStats struct {
@@ -19,14 +25,35 @@ type ContainerStats struct {
 	CPUPerc  string `json:"CPUPerc"`
 	MemPerc  string `json:"MemPerc"`
 	MemUsage string `json:"MemUsage"`
+	// NetIO is "rx / tx" summed over all networks (docker stats format);
+	// omitted when the container has no network stats (host/none mode).
+	NetIO string `json:"NetIO,omitempty"`
+	// BlockIO is "read / write" bytes (docker stats format).
+	BlockIO string `json:"BlockIO,omitempty"`
 }
 
 type StatsJSON struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	CPUStats    CPUStats    `json:"cpu_stats"`
-	PreCPUStats CPUStats    `json:"precpu_stats"`
-	MemoryStats MemoryStats `json:"memory_stats"`
+	ID          string                  `json:"id"`
+	Name        string                  `json:"name"`
+	CPUStats    CPUStats                `json:"cpu_stats"`
+	PreCPUStats CPUStats                `json:"precpu_stats"`
+	MemoryStats MemoryStats             `json:"memory_stats"`
+	Networks    map[string]NetworkStats `json:"networks"`
+	BlkioStats  BlkioStats              `json:"blkio_stats"`
+}
+
+type NetworkStats struct {
+	RxBytes uint64 `json:"rx_bytes"`
+	TxBytes uint64 `json:"tx_bytes"`
+}
+
+type BlkioStats struct {
+	IoServiceBytesRecursive []BlkioEntry `json:"io_service_bytes_recursive"`
+}
+
+type BlkioEntry struct {
+	Op    string `json:"op"`
+	Value uint64 `json:"value"`
 }
 
 type CPUStats struct {
@@ -46,198 +73,348 @@ type MemoryStats struct {
 	Stats map[string]uint64 `json:"stats"`
 }
 
-func getDockerClient() (*client.Client, error) {
-	return client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+// ErrNotFound is returned when a container does not exist.
+var ErrNotFound = errors.New("container not found")
+
+// ErrInvalidAction is returned for an unknown container action (HTTP 400).
+var ErrInvalidAction = errors.New("invalid action")
+
+// ErrWrongState is returned (wrapped, see stateError) when the container's
+// state does not allow the action: pausing a paused container, unpausing a
+// running one, killing or pausing a stopped one (HTTP 409).
+var ErrWrongState = errors.New("container state does not allow this action")
+
+// stateError is a wrong-state error with a short, fixed message: the
+// daemon's own text carries the full container id ("container 29f44a...
+// is already paused"), which clients should not have to show.
+type stateError struct {
+	msg   string
+	cause error
 }
 
-func ExecuteContainerAction(containerID string, action string) error {
-	ctx := context.Background()
+func (e *stateError) Error() string   { return e.msg }
+func (e *stateError) Unwrap() []error { return []error{ErrWrongState, e.cause} }
+
+// stateMessages maps daemon wording (lower-cased) to the short message.
+var stateMessages = []struct{ daemon, msg string }{
+	{"already paused", "container is already paused"},
+	{"is not paused", "container is not paused"},
+	{"is paused", "container is paused"},
+	{"is not running", "container is not running"},
+	{"is restarting", "container is restarting"},
+	{"marked for removal", "container is being removed"},
+}
+
+// daemonStateRe is the daemon's own wrong-state sentence ("container
+// <64-hex id> is already paused"), recognised even when the error is not
+// classified as a conflict.
+var daemonStateRe = regexp.MustCompile(`(?i)\bcontainer [0-9a-f]{12,64} is (already paused|not paused|paused|not running|restarting)\b`)
+
+// wrapState turns the daemon's wrong-state answers into a stateError. The
+// daemon sends them as 409 Conflict (errdefs.Conflict); daemonStateRe is
+// only a fallback for one that classifies them differently, narrow enough
+// that a genuine failure is never reported as a state conflict.
+func wrapState(err error) error {
+	if err == nil || (!cerrdefs.IsConflict(err) && !daemonStateRe.MatchString(err.Error())) {
+		return err
+	}
+	lower := strings.ToLower(err.Error())
+	for _, m := range stateMessages {
+		if strings.Contains(lower, m.daemon) {
+			return &stateError{msg: m.msg, cause: err}
+		}
+	}
+	return &stateError{msg: ErrWrongState.Error(), cause: err}
+}
+
+var (
+	cliMu  sync.Mutex
+	shared *client.Client
+)
+
+// getDockerClient returns a process-wide Docker client. The client is
+// goroutine-safe and connects lazily, so one instance is reused for every
+// request instead of building a new one per call.
+func getDockerClient() (*client.Client, error) {
+	cliMu.Lock()
+	defer cliMu.Unlock()
+	if shared != nil {
+		return shared, nil
+	}
+	c, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, err
+	}
+	shared = c
+	return c, nil
+}
+
+// rawInspect returns GET /containers/{id}/json exactly as the daemon sends it.
+// The moby API types decode some fields strictly (network.Port, netip.Addr):
+// one odd value, such as an image's "6881-6889/tcp" ExposedPorts key, would
+// fail the whole typed inspect and drop the container. The raw document also
+// keeps every field the daemon sends, as the old string-typed client did.
+// The path is unversioned, so the daemon answers with its own API version.
+func rawInspect(ctx context.Context, cli *client.Client, id string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/containers/"+url.PathEscape(id)+"/json", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := rawHTTPClient(cli).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxInspectBytes))
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
+	case resp.StatusCode != http.StatusOK:
+		return nil, fmt.Errorf("inspect %s: daemon answered %d", id, resp.StatusCode)
+	case !json.Valid(body):
+		return nil, fmt.Errorf("inspect %s: invalid JSON from the daemon", id)
+	}
+	return body, nil
+}
+
+// fullIDRe is a container's full id.
+var fullIDRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// ContainerFullID returns the full (64 hex) id of a container given by id,
+// id prefix or name.
+func ContainerFullID(ctx context.Context, ref string) (string, error) {
+	cli, err := getDockerClient()
+	if err != nil {
+		return "", err
+	}
+	body, err := rawInspect(ctx, cli, ref)
+	if err != nil {
+		return "", err
+	}
+	var v struct {
+		ID string `json:"Id"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return "", err
+	}
+	if !fullIDRe.MatchString(v.ID) {
+		return "", fmt.Errorf("inspect %s: unexpected id", ref)
+	}
+	return v.ID, nil
+}
+
+// maxInspectBytes bounds one inspect document (normally a few KiB).
+const maxInspectBytes = 8 << 20
+
+var (
+	rawMu     sync.Mutex
+	rawFor    *client.Client
+	rawClient *http.Client
+)
+
+// rawHTTPClient speaks HTTP over the Docker client's own connection (socket,
+// TLS and custom transports as configured), one instance per Docker client.
+func rawHTTPClient(cli *client.Client) *http.Client {
+	rawMu.Lock()
+	defer rawMu.Unlock()
+	if rawFor != cli {
+		dial := cli.Dialer()
+		rawClient = &http.Client{Transport: &http.Transport{
+			DialContext:     func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
+			MaxIdleConns:    inspectConcurrency,
+			IdleConnTimeout: 30 * time.Second,
+		}}
+		rawFor = cli
+	}
+	return rawClient
+}
+
+func wrapNotFound(err error) error {
+	if err != nil && cerrdefs.IsNotFound(err) {
+		return fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	return err
+}
+
+// ExecuteContainerAction runs a lifecycle action. containerID must already be
+// normalised and validated by the caller.
+func ExecuteContainerAction(ctx context.Context, containerID string, action string) error {
 	cli, err := getDockerClient()
 	if err != nil {
 		return err
 	}
-	defer cli.Close()
-
 	switch action {
 	case "start":
-		return cli.ContainerStart(ctx, containerID, container.StartOptions{})
+		_, err = cli.ContainerStart(ctx, containerID, client.ContainerStartOptions{})
 	case "stop":
-		return cli.ContainerStop(ctx, containerID, container.StopOptions{})
+		_, err = cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{})
 	case "restart":
-		return cli.ContainerRestart(ctx, containerID, container.StopOptions{})
+		_, err = cli.ContainerRestart(ctx, containerID, client.ContainerRestartOptions{})
 	case "kill":
-		return cli.ContainerKill(ctx, containerID, "KILL")
+		_, err = cli.ContainerKill(ctx, containerID, client.ContainerKillOptions{Signal: "KILL"})
 	case "pause":
-		return cli.ContainerPause(ctx, containerID)
+		_, err = cli.ContainerPause(ctx, containerID, client.ContainerPauseOptions{})
 	case "unpause":
-		return cli.ContainerUnpause(ctx, containerID)
+		_, err = cli.ContainerUnpause(ctx, containerID, client.ContainerUnpauseOptions{})
 	default:
-		return fmt.Errorf("invalid action: %s", action)
+		return fmt.Errorf("%w: %s", ErrInvalidAction, action)
 	}
+	invalidateAll()
+	if err != nil && !cerrdefs.IsNotFound(err) {
+		return wrapState(err)
+	}
+	return wrapNotFound(err)
 }
 
-func GetContainerStats(containerID string) ([]ContainerStats, error) {
-	ctx := context.Background()
+// ---- container list -------------------------------------------------------
+
+const (
+	inspectConcurrency = 6
+	inspectTTL         = 30 * time.Second
+)
+
+type inspectEntry struct {
+	state   string
+	fetched time.Time
+	data    []byte // marshalled inspect JSON; decoded fresh for every caller
+}
+
+var (
+	cacheMu      sync.Mutex
+	inspectCache = map[string]inspectEntry{}
+)
+
+func invalidateAll() {
+	cacheMu.Lock()
+	inspectCache = map[string]inspectEntry{}
+	cacheMu.Unlock()
+}
+
+// ContainerOptions controls GetContainers.
+type ContainerOptions struct {
+	// Size asks Docker to compute SizeRw/SizeRootFs. Expensive (walks every
+	// container's layers and may wake array disks), so off by default.
+	Size bool
+}
+
+// GetContainers returns the inspect JSON of every container (the protocol-1
+// shape the app parses) with "AutoStart" injected, and "SizeRw"/"SizeRootFs"
+// when opts.Size is set. Inspect results are cached per container for a short
+// time and refreshed whenever the container's state changes; inspections run
+// with bounded concurrency. Every call returns freshly decoded maps that the
+// caller may modify (e.g. to strip Config.Env) without affecting the cache.
+func GetContainers(ctx context.Context, opts ContainerOptions) ([]map[string]any, error) {
 	cli, err := getDockerClient()
 	if err != nil {
 		return nil, err
 	}
-	defer cli.Close()
-
-	var containers []types.Container
-	if containerID != "" {
-		containers = append(containers, types.Container{ID: containerID})
-	} else {
-		containers, err = cli.ContainerList(ctx, container.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	results := make([]ContainerStats, len(containers))
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for idx, c := range containers {
-		wg.Add(1)
-		go func(c types.Container, i int) {
-			defer wg.Done()
-
-			stats, err := cli.ContainerStats(ctx, c.ID, true)
-			if err != nil {
-				return
-			}
-			defer stats.Body.Close()
-
-			var statsJSON StatsJSON
-			decoder := json.NewDecoder(stats.Body)
-
-			if err := decoder.Decode(&statsJSON); err != nil {
-				return
-			}
-
-			if statsJSON.PreCPUStats.CPUUsage.TotalUsage == 0 {
-				var secondStats StatsJSON
-				if err := decoder.Decode(&secondStats); err == nil {
-					statsJSON = secondStats
-				}
-			}
-
-			// Calculate CPU %
-			var cpuPercent = 0.0
-			cpuDelta := float64(statsJSON.CPUStats.CPUUsage.TotalUsage) - float64(statsJSON.PreCPUStats.CPUUsage.TotalUsage)
-			systemDelta := float64(statsJSON.CPUStats.SystemUsage) - float64(statsJSON.PreCPUStats.SystemUsage)
-
-			if systemDelta > 0.0 && cpuDelta > 0.0 {
-				onlineCPUs := float64(statsJSON.CPUStats.OnlineCPUs)
-				if onlineCPUs == 0.0 {
-					onlineCPUs = float64(len(statsJSON.CPUStats.CPUUsage.PercpuUsage))
-				}
-				cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
-			}
-
-			// Calculate Mem % & Usage
-			memUsage := float64(statsJSON.MemoryStats.Usage)
-			if cache, ok := statsJSON.MemoryStats.Stats["cache"]; ok {
-				memUsage = memUsage - float64(cache)
-			} else if inactive, ok := statsJSON.MemoryStats.Stats["inactive_file"]; ok {
-				memUsage = memUsage - float64(inactive)
-			}
-
-			memLimit := float64(statsJSON.MemoryStats.Limit)
-			memPercent := 0.0
-			if memLimit > 0 {
-				memPercent = (memUsage / memLimit) * 100.0
-			}
-
-			statItem := ContainerStats{
-				ID:       c.ID,
-				CPUPerc:  fmt.Sprintf("%.2f%%", cpuPercent),
-				MemPerc:  fmt.Sprintf("%.2f%%", memPercent),
-				MemUsage: fmt.Sprintf("%s / %s", units.HumanSize(memUsage), units.HumanSize(memLimit)),
-			}
-
-			mu.Lock()
-			results[i] = statItem
-			mu.Unlock()
-		}(c, idx)
-	}
-
-	wg.Wait()
-
-	// Filter out uninitialized items (if any container stats failed)
-	filteredResults := make([]ContainerStats, 0, len(results))
-	for _, res := range results {
-		if res.ID != "" {
-			filteredResults = append(filteredResults, res)
-		}
-	}
-
-	return filteredResults, nil
-}
-
-func GetContainers() ([]interface{}, error) {
-	ctx := context.Background()
-	cli, err := getDockerClient()
+	listed, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true, Size: opts.Size})
 	if err != nil {
-		return []interface{}{}, err
+		return nil, err
 	}
-	defer cli.Close()
-
-	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true, Size: true})
-	if err != nil {
-		return []interface{}{}, err
-	}
-
+	containers := listed.Items
 	if len(containers) == 0 {
-		return []interface{}{}, nil
+		return []map[string]any{}, nil
 	}
 
-	// 2. Read Unraid Autostart File
-	autoStartMap := make(map[string]bool)
-	if content, err := os.ReadFile("/var/lib/docker/unraid-autostart"); err == nil {
-		lines := strings.Split(string(content), "\n")
-		for _, line := range lines {
-			parts := strings.Fields(line)
-			if len(parts) > 0 {
-				autoStartMap[parts[0]] = true
-			}
-		}
-	}
+	autoStart := readAutostart("/var/lib/docker/unraid-autostart")
 
-	// 3. Inspect each container to match original output format (full JSON) and inject fields
-	result := make([]interface{}, 0)
-
-	for _, c := range containers {
-		// We need full details
-		jsonBytes, err := cli.ContainerInspect(ctx, c.ID)
-		if err != nil {
+	raw := make([][]byte, len(containers))
+	sem := make(chan struct{}, inspectConcurrency)
+	var wg sync.WaitGroup
+	now := time.Now()
+	for i, c := range containers {
+		cacheMu.Lock()
+		e, ok := inspectCache[c.ID]
+		cacheMu.Unlock()
+		if ok && e.state == string(c.State) && now.Sub(e.fetched) < inspectTTL {
+			raw[i] = e.data
 			continue
 		}
-
-		// Convert to map to inject fields
-		var containerMap map[string]interface{}
-
-		b, _ := json.Marshal(jsonBytes)
-		json.Unmarshal(b, &containerMap)
-
-		name := ""
-		if n, ok := containerMap["Name"].(string); ok {
-			name = strings.TrimPrefix(n, "/")
-		}
-
-		// Inject AutoStart
-		if autoStartMap[name] {
-			containerMap["AutoStart"] = true
-		} else {
-			containerMap["AutoStart"] = false
-		}
-
-		containerMap["SizeRw"] = c.SizeRw
-		containerMap["SizeRootFs"] = c.SizeRootFs
-
-		result = append(result, containerMap)
+		wg.Add(1)
+		go func(i int, id, state string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			b, err := rawInspect(ctx, cli, id)
+			if err != nil {
+				if !errors.Is(err, ErrNotFound) && ctx.Err() == nil {
+					log.Printf("docker: inspect %s: %v", id, err)
+				}
+				return // removed between list and inspect, or the daemon failed
+			}
+			raw[i] = b
+			cacheMu.Lock()
+			inspectCache[id] = inspectEntry{state: state, fetched: time.Now(), data: b}
+			cacheMu.Unlock()
+		}(i, c.ID, string(c.State))
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
+	// Drop cache entries for containers that no longer exist.
+	live := make(map[string]bool, len(containers))
+	for _, c := range containers {
+		live[c.ID] = true
+	}
+	cacheMu.Lock()
+	for id := range inspectCache {
+		if !live[id] {
+			delete(inspectCache, id)
+		}
+	}
+	cacheMu.Unlock()
+
+	result := make([]map[string]any, 0, len(containers))
+	for i, c := range containers {
+		if raw[i] == nil {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw[i], &m); err != nil {
+			continue
+		}
+		name := ""
+		if n, ok := m["Name"].(string); ok {
+			name = strings.TrimPrefix(n, "/")
+		}
+		m["AutoStart"] = autoStart[name]
+		if opts.Size {
+			m["SizeRw"] = c.SizeRw
+			m["SizeRootFs"] = c.SizeRootFs
+		}
+		result = append(result, m)
+	}
 	return result, nil
+}
+
+func readAutostart(path string) map[string]bool {
+	out := map[string]bool{}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			out[f[0]] = true
+		}
+	}
+	return out
+}
+
+// StripEnv removes Config.Env from an inspect map in place. The map must be
+// one returned by GetContainers (never shared with the cache).
+func StripEnv(m map[string]any) {
+	if cfg, ok := m["Config"].(map[string]any); ok {
+		delete(cfg, "Env")
+	}
 }

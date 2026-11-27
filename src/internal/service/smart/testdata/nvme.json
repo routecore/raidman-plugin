@@ -1,0 +1,28 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {"version": [7, 4], "exit_status": 0},
+  "device": {"name": "/dev/nvme0n1", "type": "nvme", "protocol": "NVMe"},
+  "smart_status": {"passed": true, "nvme": {"value": 0}},
+  "nvme_smart_health_information_log": {
+    "critical_warning": 0,
+    "temperature": 41,
+    "available_spare": 5,
+    "available_spare_threshold": 10,
+    "percentage_used": 3,
+    "data_units_read": 123456789,
+    "data_units_written": 98765432,
+    "host_reads": 1,
+    "host_writes": 2,
+    "controller_busy_time": 3,
+    "power_cycles": 120,
+    "power_on_hours": 8000,
+    "unsafe_shutdowns": 7,
+    "media_errors": 0,
+    "num_err_log_entries": 12,
+    "warning_temp_time": 0,
+    "critical_comp_time": 0,
+    "temperature_sensors": [41, 45]
+  },
+  "temperature": {"current": 41},
+  "power_on_time": {"hours": 8000}
+}

@@ -1,0 +1,9 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "dynamix.system.temp">
+<!ENTITY author    "Bergware">
+<!ENTITY version   "2024.12.01">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/bergware/dynamix/master/unRAIDv6/&name;.plg">
+]>
+<PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;">
+</PLUGIN>

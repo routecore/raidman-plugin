@@ -1,0 +1,10 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 4],
+    "messages": [
+      {"string": "/dev/sdf: Unknown USB bridge [0x346d:0x5678 (0x200)]", "severity": "error"}
+    ],
+    "exit_status": 1
+  }
+}

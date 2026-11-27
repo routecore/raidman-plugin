@@ -15,7 +15,7 @@ type ParityCheckHistory struct {
 }
 
 func GetParityHistory() ([]ParityCheckHistory, error) {
-	path := "/boot/config/parity-checks.log"
+	path := ParityLogPath
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return []ParityCheckHistory{}, nil

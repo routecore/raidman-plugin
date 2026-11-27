@@ -1,46 +1,5 @@
 package domain
 
-// Constants
-const (
-	KeysPath = "/boot/config/plugins/dynamix.my.servers/keys"
-)
-
-// ApiKeyPermissions represents an API key with its associated permissions and roles
-type ApiKeyPermissions struct {
-	Key         string   `json:"key"`
-	Permissions []string `json:"permissions"` // e.g., ["docker:*", "vm:read", "system:update"]
-	Roles       []string `json:"roles"`       // e.g., ["ADMIN", "VIEWER"]
-}
-
-// Permission constants for resource-based access control
-const (
-	// Resources
-	PermResourceDocker  = "docker"
-	PermResourceVM      = "vm"
-	PermResourceSystem  = "system"
-	PermResourceArray   = "array"
-	PermResourceShare   = "share"
-	PermResourceNetwork = "network"
-
-	// Actions
-	PermActionCreate = "create"
-	PermActionRead   = "read"
-	PermActionUpdate = "update"
-	PermActionDelete = "delete"
-	PermActionAll    = "*"
-)
-
-// SecurityLevel defines the security requirements for different operations
-type SecurityLevel int
-
-const (
-	SecurityLevelPublic     SecurityLevel = iota // No auth needed
-	SecurityLevelRead                            // Read-only operations
-	SecurityLevelWrite                           // Write operations
-	SecurityLevelPrivileged                      // Terminal, VNC, system actions
-	SecurityLevelAdmin                           // Full system control
-)
-
 // XML Structures for parsing virsh dumpxml
 type DomainXml struct {
 	Description string   `xml:"description"`
@@ -123,10 +82,31 @@ type VmDisk struct {
 }
 
 type VmInterface struct {
-	Mac       string `json:"mac"`
-	Model     string `json:"model"`
-	Network   string `json:"network"`
+	Mac     string `json:"mac"`
+	Model   string `json:"model"`
+	Network string `json:"network"`
+	// IpAddress is this NIC's first usable address (IPv4 preferred), "" if
+	// unknown. Older plugins sent the first IPv4 found for any NIC of the
+	// VM (host ARP table only) on every NIC.
 	IpAddress string `json:"ipAddress"`
+	// IpAddresses lists every usable address of this NIC (IPv4 first; no
+	// loopback/link-local). Present (possibly empty) when
+	// /api/health lists "vm.ips"; older plugins omit it.
+	IpAddresses []string `json:"ipAddresses"`
+}
+
+// VmHostdev is a PCI or USB passthrough device (<devices><hostdev>).
+type VmHostdev struct {
+	Type string `json:"type"` // "pci" | "usb"
+	// Kind is "gpu" (PCI class 0x03), "audio" (0x0403), "usb" (USB device or
+	// PCI USB controller 0x0c03), or null.
+	Kind   *string `json:"kind"`
+	Name   *string `json:"name"`
+	Vendor *string `json:"vendor"`
+	// Address is the host PCI address ("0000:01:00.0"), the USB
+	// "vendor:product" ids ("046d:c52b"), or "bus.device" ("001.004") for a
+	// USB device given by bus address only.
+	Address string `json:"address"`
 }
 
 type VmGraphics struct {
@@ -154,6 +134,9 @@ type VmInfo struct {
 	Disks         []VmDisk      `json:"disks"`
 	Interfaces    []VmInterface `json:"interfaces"`
 	Graphics      []VmGraphics  `json:"graphics"`
+	// Hostdevs is [] when the domain has no passthrough devices and null when
+	// the domain XML could not be read. Protocol-1 plugins omit it.
+	Hostdevs []VmHostdev `json:"hostdevs"`
 }
 
 type AutostartRequest struct {
@@ -169,7 +152,37 @@ type ArrayStatus struct {
 	Disks             []ArrayDisk        `json:"disks"`
 	Caches            []ArrayDisk        `json:"caches"`
 	Boot              *ArrayDisk         `json:"boot"`
-	Unassigned        []ArrayDisk        `json:"unassigned"`
+	// BootDevices lists every boot slot (Unraid 7.3 internal boot pools can
+	// have several). Optional; older plugin versions omit it.
+	BootDevices []ArrayDisk `json:"bootDevices,omitempty"`
+	Unassigned  []ArrayDisk `json:"unassigned"`
+	// Health is the var.ini array health (nil when var.ini is unreadable).
+	// Optional; older plugin versions omit it.
+	Health *ArrayHealth `json:"health,omitempty"`
+}
+
+// ArrayHealth mirrors the app's ArrayHealth (field names and types) so it
+// can be used as is. Values come straight from /var/local/emhttp/var.ini.
+type ArrayHealth struct {
+	ResyncPos int64 `json:"resyncPos"` // mdResyncPos (KiB)
+	ResyncDb  int64 `json:"resyncDb"`  // mdResyncDb (KiB in the last sample)
+	ResyncDt  int64 `json:"resyncDt"`  // mdResyncDt (seconds of the last sample)
+	// ResyncAction is mdResyncAction: "check P", "check P Q", "recon P",
+	// "recon D5", "clear"; null when empty.
+	ResyncAction   *string `json:"resyncAction"`
+	NumDisabled    int64   `json:"numDisabled"`
+	NumInvalid     int64   `json:"numInvalid"`
+	NumMissing     int64   `json:"numMissing"`
+	FsState        *string `json:"fsState"`
+	FsProgress     *string `json:"fsProgress"`
+	FsCopyPercent  int64   `json:"fsCopyPercent"` // fsCopyPrcnt
+	NumUnmountable int64   `json:"numUnmountable"`
+	MoverActive    bool    `json:"moverActive"` // shareMoverActive
+	SafeMode       bool    `json:"safeMode"`
+	// ConfigValid is var.ini configValid as emhttp writes it: "yes", or why
+	// the webGUI keeps Start disabled ("error", "invalid", "ineligible",
+	// "nokeyserver", "withdrawn"). Null when var.ini has none.
+	ConfigValid *string `json:"configValid"`
 }
 
 type ParityCheckStatus struct {
@@ -178,13 +191,23 @@ type ParityCheckStatus struct {
 	Paused          bool   `json:"paused"`
 	Progress        string `json:"progress"` // "0.0" to "100.0"
 	Speed           string `json:"speed"`    // e.g. "120.5 MB/s" or just number
-	Duration        int64  `json:"duration"` // Seconds
+	Duration        int64  `json:"duration"` // Seconds: now-sbSynced while running/paused, sbSynced2-sbSynced (last op) when idle
 	Date            string `json:"date"`     // Unix Timestamp or Date String
 	Errors          int64  `json:"errors"`
 	ErrorsThisCheck int64  `json:"errorsThisCheck"` // Errors found during current check
 	Pos             int64  `json:"pos"`
 	Total           int64  `json:"total"`
 	TimeRemaining   int64  `json:"timeRemaining"` // Estimated Seconds Remaining
+
+	// Errors/ErrorsThisCheck come from sbSyncErrs. Correcting is mdResyncCorr == 1 while a check
+	// runs (false when idle) and is always sent: its presence tells the app the errors are
+	// sbSyncErrs-based (older plugins put the mdResyncCorr flag in Errors).
+	Correcting bool `json:"correcting"`
+
+	// Action is the raw mdResyncAction of the running or paused operation
+	// ("check P", "recon D1", "clear", ...); omitted when idle. It tells a
+	// rebuild or clear apart from a parity check.
+	Action string `json:"action,omitempty"`
 }
 
 type ArrayDisk struct {
@@ -208,4 +231,8 @@ type ArrayDisk struct {
 	FsFree     int64   `json:"fsFree"`
 	FsType     string  `json:"fsType"`
 	IsSpinning bool    `json:"isSpinning"`
+	// Optional fields (added in protocol 2).
+	Type         string `json:"type,omitempty"` // disks.ini slot type: Parity, Data, Cache, Flash, Boot
+	FsStatus     string `json:"fsStatus,omitempty"`
+	FsMountpoint string `json:"fsMountpoint,omitempty"`
 }

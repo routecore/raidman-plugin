@@ -1,0 +1,28 @@
+{
+    "library/redis:latest": {
+        "local": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "remote": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "status": "false"
+    },
+    "lscr.io/linuxserver/plex:latest": {
+        "local": "sha256:aaaa",
+        "remote": "sha256:AAAA",
+        "status": "true"
+    },
+    "registry.local:5000/team/app:1.2": {
+        "local": null,
+        "remote": null,
+        "status": "false"
+    },
+    "ghcr.io/home-assistant/home-assistant:stable": {
+        "local": "sha256:abcd",
+        "remote": null,
+        "status": "undef"
+    },
+    "jellyfin/jellyfin:latest": {
+        "local": null,
+        "remote": "sha256:ffff",
+        "status": "true"
+    },
+    "broken/entry:latest": "not-an-object"
+}

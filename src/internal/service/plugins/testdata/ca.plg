@@ -1,0 +1,23 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "community.applications">
+<!ENTITY author    "Andrew Zawadzki">
+<!ENTITY version   "2025.01.10">
+<!ENTITY md5       "abc">
+<!ENTITY launch    "Apps">
+<!ENTITY plugdir   "/usr/local/emhttp/plugins/&name;">
+<!ENTITY github    "Squidly271/community.applications">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/&github;/master/plugins/&name;.plg">
+]>
+
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support='https://forums.unraid.net/topic/38582' icon="users" min="6.9.0">
+<CHANGES>
+### 2025.01.10
+- Fixes &amp; tweaks with <b>html</b>
+</CHANGES>
+<FILE Run="/bin/bash">
+<INLINE>
+echo "if [ 1 &lt; 2 ]; then"
+</INLINE>
+</FILE>
+</PLUGIN>

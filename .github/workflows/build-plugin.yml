@@ -1,49 +1,277 @@
 name: Build Unraid Plugin
 
+# Release flow (see "Releasing" in README.md): push a tag YYYY.MM.DD[a-z] on
+# main. The release job builds the package, stamps <!ENTITY version> (the tag)
+# and <!ENTITY sha256> into raidman.plg, publishes the GitHub release, and
+# then commits the stamped raidman.plg to main, which installed servers poll.
 on:
   push:
-    tags:
-      - "*"
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1" # weekly: new Go vulnerabilities between releases
+  workflow_dispatch:
 
+# Read-only by default; only the release job can write.
 permissions:
-  contents: write
+  contents: read
+
+env:
+  # Latest patch of the Go line in go.mod (check-latest below). Standard-library
+  # security fixes such as GO-2026-6859 (net/http) only land on the newest lines.
+  GO_VERSION: "1.26.x"
+  GOTOOLCHAIN: local
+  # noVNC shipped inside the package for the in-app VM console. The hash is
+  # of https://github.com/novnc/noVNC/archive/refs/tags/v<version>.tar.gz;
+  # change both together.
+  NOVNC_VERSION: "1.6.0"
+  NOVNC_SHA256: "5066103959ef4e9b10f37e5a148627360dd8414e4cf8a7db92bdbd022e728aaa"
 
 jobs:
-  build:
-    name: Build Raidman
+  test:
+    name: Vet, test and package
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: 'go.mod'
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: go.sum
 
-      - name: Build
-        env:
-          GOOS: linux
-          GOARCH: amd64
-          CGO_ENABLED: 0
-        run: |
-          go mod download
-          go build -v -o raidman src/cmd/app/main.go
+      - name: Install xmllint
+        run: command -v xmllint >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q libxml2-utils; }
 
-      - name: Extract Release Notes
-        run: |
-          # Extract the line matching the version tag, remove XML tags and whitespace
-          # Strip leading 'v' from tag if present (e.g. v2026.02.10 -> 2026.02.10)
-          TAG_NAME="${{ github.ref_name }}"
-          VERSION="${TAG_NAME#v}"
-          grep "<CHANGE>${VERSION}" raidman.plg | sed -e 's/<CHANGE>//' -e 's/<\/CHANGE>//' -e 's/^[ \t]*//' > release_notes.txt || true
-          # If empty, default to the tag name
-          if [ ! -s release_notes.txt ]; then echo "${{ github.ref_name }}" > release_notes.txt; fi
+      - name: Vet
+        run: go vet ./...
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Test
+        run: go test -race ./...
+
+      # Well-formed XML, entities resolve, every download has a <SHA256> (the
+      # Community Applications rule), inline install/remove scripts and all
+      # shell scripts parse. The hash itself is asserted in the last step.
+      - name: Check raidman.plg and scripts
+        run: bash scripts/check-plg.sh --allow-unstamped
+
+      - name: Build release binary (linux/amd64, static) and smoke-test it
+        run: bash scripts/build.sh ci-check dist/raidman
+
+      - name: Fetch noVNC
+        run: |
+          bash scripts/fetch-novnc.sh "$RUNNER_TEMP/novnc.tar.gz"
+          echo "NOVNC_TARBALL=$RUNNER_TEMP/novnc.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (twice; must be byte-identical) and check contents
+        run: |
+          bash scripts/package.sh ci-check dist/raidman dist/a
+          bash scripts/package.sh ci-check dist/raidman dist/b
+          cmp dist/a/raidman-ci-check.tgz dist/b/raidman-ci-check.tgz
+          bash scripts/check-package.sh dist/a/raidman-ci-check.tgz
+
+      - name: Service script (start, crash restart, stop, double start)
+        run: bash scripts/test-rc.sh dist/raidman
+
+      # The plg on main (and so on every branch and pull request) always
+      # carries a real package SHA-256. A tag's plg is re-stamped and checked
+      # strictly by the release job, so it may still be unstamped (bootstrap).
+      - name: raidman.plg is stamped
+        if: github.ref_type != 'tag'
+        run: bash scripts/check-plg.sh
+
+      # The plg on main points at the last release, so its install script
+      # must still accept that package (a change here that needs a new file
+      # would break installs of the current version until the next tag).
+      - name: Install script fits the released package
+        if: github.ref_type != 'tag'
+        run: bash scripts/check-released.sh
+
+  # Not a release gate: a new advisory should be visible, not block a fix.
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          files: raidman
-          body_path: release_notes.txt
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: go.sum
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+  release:
+    name: Build and release
+    needs: test
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The tag is the plugin version and ends up in file names, the download
+      # URL and shell commands: validate it before anything else.
+      - name: Validate tag
+        run: |
+          if [[ ! "$TAG" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}[a-z]?$ ]]; then
+            echo "::error::Tag '$TAG' is not a plugin version (YYYY.MM.DD or YYYY.MM.DDa)"
+            exit 1
+          fi
+          echo "VERSION=$TAG" >> "$GITHUB_ENV"
+
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # ancestry check against main
+          persist-credentials: false # scripts/stamp-main.sh authenticates only its push
+
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: go.sum
+
+      - name: Install xmllint
+        run: command -v xmllint >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q libxml2-utils; }
+
+      # Everything that can fail is checked before anything is published.
+      - name: Preflight
+        run: |
+          set -euo pipefail
+          if ! grep -qF "<CHANGE>${VERSION} - " raidman.plg; then
+            echo "::error::raidman.plg has no '<CHANGE>${VERSION} - ...</CHANGE>' entry for this tag"
+            exit 1
+          fi
+          git fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main ||
+             git diff --quiet "$GITHUB_SHA" origin/main -- . ':(exclude)raidman.plg'; then
+            echo "STAMP_MAIN=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::$TAG is not on main: the release is published, but main's raidman.plg is not stamped (see 'Releasing' in README.md)"
+            echo "STAMP_MAIN=false" >> "$GITHUB_ENV"
+          fi
+          MAIN_VERSION=$(git show origin/main:raidman.plg | sed -n 's/^<!ENTITY version *"\([^"]*\)">$/\1/p')
+          if [ "$MAIN_VERSION" != "$VERSION" ] &&
+             [ "$(printf '%s\n%s\n' "$MAIN_VERSION" "$VERSION" | sort -V | tail -n 1)" = "$MAIN_VERSION" ]; then
+            echo "::error::main is already at $MAIN_VERSION, newer than $TAG"
+            exit 1
+          fi
+          # A published package is never replaced: a re-run reuses it, but only
+          # if this job built it from this very commit. The release notes
+          # record the commit ("Source commit: <sha>"); a release made by hand,
+          # by an older workflow or for a tag that was since moved has no
+          # matching line and is refused.
+          if gh release view "$VERSION" --json assets,body,isDraft > "$RUNNER_TEMP/release.json" 2> "$RUNNER_TEMP/err.txt"; then
+            # An interrupted upload leaves an asset that is not "uploaded".
+            jq -r '.assets[] | select((.state // "uploaded") == "uploaded") | .name' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/assets.txt"
+            if ! grep -qx "raidman-${VERSION}.tgz" "$RUNNER_TEMP/assets.txt"; then
+              echo "::error::Release $VERSION exists without raidman-${VERSION}.tgz; delete it or use a new tag"
+              exit 1
+            fi
+            jq -r '.body // ""' "$RUNNER_TEMP/release.json" | tr -d '\r' > "$RUNNER_TEMP/body.txt"
+            if ! grep -qxF "Source commit: $GITHUB_SHA" "$RUNNER_TEMP/body.txt"; then
+              echo "::error::Release $VERSION was not built from $GITHUB_SHA by this workflow (no 'Source commit: $GITHUB_SHA' in its notes); release a new tag"
+              exit 1
+            fi
+            echo "Release $VERSION already exists (built from $GITHUB_SHA); reusing its package."
+            echo "REUSE=true" >> "$GITHUB_ENV"
+            echo "RELEASE_DRAFT=$(jq -r '.isDraft' "$RUNNER_TEMP/release.json")" >> "$GITHUB_ENV"
+          elif grep -qi 'not found' "$RUNNER_TEMP/err.txt"; then
+            echo "REUSE=false" >> "$GITHUB_ENV"
+          else
+            cat "$RUNNER_TEMP/err.txt"
+            exit 1
+          fi
+
+      - name: Build
+        if: env.REUSE == 'false'
+        run: bash scripts/build.sh "$VERSION" dist/raidman
+
+      - name: Package
+        if: env.REUSE == 'false'
+        run: |
+          bash scripts/fetch-novnc.sh "$RUNNER_TEMP/novnc.tar.gz"
+          NOVNC_TARBALL="$RUNNER_TEMP/novnc.tar.gz" bash scripts/package.sh "$VERSION" dist/raidman dist
+          bash scripts/check-package.sh "dist/raidman-${VERSION}.tgz"
+
+      # The same content check as a fresh build, before anything is stamped.
+      - name: Download and check the published package
+        if: env.REUSE == 'true'
+        run: |
+          set -euo pipefail
+          gh release download "$VERSION" --pattern "raidman-${VERSION}.tgz" --dir dist
+          bash scripts/check-package.sh "dist/raidman-${VERSION}.tgz"
+
+      - name: Stamp raidman.plg
+        run: |
+          set -euo pipefail
+          SHA256=$(sha256sum "dist/raidman-${VERSION}.tgz" | awk '{print $1}')
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "${SHA256}  raidman-${VERSION}.tgz" > "dist/raidman-${VERSION}.tgz.sha256"
+          cp raidman.plg dist/raidman.plg
+          bash scripts/stamp-plg.sh dist/raidman.plg "$VERSION" "$SHA256"
+          bash scripts/check-plg.sh dist/raidman.plg
+          awk -v p="<CHANGE>${VERSION} - " 'index($0, p) == 1 { print substr($0, length(p) + 1) }' raidman.plg |
+            sed 's|</CHANGE>$||' > dist/release_notes.txt
+          [ -s dist/release_notes.txt ] || echo "RaidMan $VERSION" > dist/release_notes.txt
+          # Read back by Preflight on a re-run; keep the exact form.
+          printf '\nSource commit: %s\n' "$GITHUB_SHA" >> dist/release_notes.txt
+
+      # gh release create fails when the release already exists, so a
+      # published package is never overwritten.
+      - name: Publish release
+        if: env.REUSE == 'false'
+        run: |
+          gh release create "$VERSION" --verify-tag --title "$VERSION" --notes-file dist/release_notes.txt \
+            "dist/raidman-${VERSION}.tgz" "dist/raidman-${VERSION}.tgz.sha256" dist/raidman.plg
+
+      # A run cancelled during `gh release create` leaves a draft release
+      # (gh creates it as a draft, uploads, then publishes) that may lack
+      # some assets. Add the missing ones (never --clobber) and publish it.
+      - name: Complete the existing release
+        if: env.REUSE == 'true'
+        run: |
+          set -euo pipefail
+          for f in "raidman-${VERSION}.tgz.sha256" raidman.plg; do
+            if ! grep -qxF "$f" "$RUNNER_TEMP/assets.txt"; then
+              echo "Uploading missing release asset $f"
+              gh release upload "$VERSION" "dist/$f"
+            fi
+          done
+          if [ "$RELEASE_DRAFT" = "true" ]; then
+            gh release edit "$VERSION" --draft=false
+          fi
+
+      # main is only ever stamped with the hash of what is downloadable.
+      - name: Verify the published package
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/published"
+          gh release download "$VERSION" --pattern "raidman-${VERSION}.tgz" --dir "$RUNNER_TEMP/published" --clobber
+          GOT=$(sha256sum "$RUNNER_TEMP/published/raidman-${VERSION}.tgz" | awk '{print $1}')
+          if [ "$GOT" != "$SHA256" ]; then
+            echo "::error::published package has SHA-256 $GOT, expected $SHA256"
+            exit 1
+          fi
+
+      - name: Commit the stamped raidman.plg to main
+        if: env.STAMP_MAIN == 'true'
+        run: bash scripts/stamp-main.sh "$VERSION" "$SHA256" "$GITHUB_SHA"

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<Container version="2">
+  <Name>nextcloud</Name>
+  <Repository>lscr.io/linuxserver/nextcloud:latest</Repository>
+  <Shell>/bin/zsh</Shell>
+  <WebUI>https://[IP]:[PORT:443]/</WebUI>
+  <Icon>https://example.invalid/nextcloud.png</Icon>
+  <Support></Support>
+  <Overview>Uses an HTML entity&nbsp;the PHP loader tolerates.</Overview>
+  <Config Name="WebUI" Target="443" Default="444" Mode="tcp" Type="Port">444</Config>
+</Container>

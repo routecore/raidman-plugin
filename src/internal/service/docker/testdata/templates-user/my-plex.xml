@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Plex</Name>
+  <Repository>lscr.io/linuxserver/plex</Repository>
+  <Registry>https://github.com/orgs/linuxserver/packages/container/package/plex</Registry>
+  <Network>bridge</Network>
+  <Shell>bash</Shell>
+  <Support>https://forums.unraid.net/topic/40463-support-linuxserverio-plex-media-server/</Support>
+  <Project>https://www.plex.tv/</Project>
+  <Overview>Plex organizes video, music and photos &amp; more.</Overview>
+  <WebUI>http://[IP]:[PORT:32400]/web</WebUI>
+  <Icon>https://raw.githubusercontent.com/linuxserver/docker-templates/master/linuxserver.io/img/plex-logo.png</Icon>
+  <Config Name="Web UI" Target="32400" Default="32400" Mode="tcp" Description="" Type="Port" Display="always" Required="true" Mask="false">32401</Config>
+  <Config Name="Media" Target="/media" Default="" Mode="rw" Description="" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/media</Config>
+</Container>
