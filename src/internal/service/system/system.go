@@ -15,6 +15,7 @@ package system
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"syscall"
@@ -70,7 +71,9 @@ func ExecuteAction(action string, opts Options) error {
 			}
 			f.Close()
 		} else if err := os.Remove(SafeModeFlag); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("could not clear safe mode flag: %w", err)
+			// Boot.php clears it with a silent @unlink and goes on: a flag that
+			// cannot be removed must not block a normal reboot or shutdown.
+			log.Printf("[system] could not clear safe mode flag %s: %v", SafeModeFlag, err)
 		}
 	}
 	if err := StartDetached(bin); err != nil {

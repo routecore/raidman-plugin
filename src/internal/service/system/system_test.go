@@ -75,6 +75,22 @@ func TestSafeModeFlag(t *testing.T) {
 	}
 }
 
+// A flag that cannot be removed (here: a non-empty directory in its place)
+// must not stop the reboot, like Boot.php's @unlink.
+func TestSafeModeClearFailureStillReboots(t *testing.T) {
+	calls, _ := setup(t)
+	if err := os.MkdirAll(filepath.Join(SafeModeFlag, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	no := false
+	if err := ExecuteAction("reboot", Options{SafeMode: &no}); err != nil {
+		t.Fatalf("reboot refused: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("reboot not started: %v", *calls)
+	}
+}
+
 func TestMissingBinary(t *testing.T) {
 	calls, _ := setup(t)
 	os.Remove(RebootBinary)
