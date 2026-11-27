@@ -19,6 +19,11 @@ func TestMain(m *testing.M) {
 	StampsPath = filepath.Join(dir, "stamps.ini")
 	ResyncPath = filepath.Join(dir, "resync.ini")
 	ParityLogPath = filepath.Join(dir, "parity-checks.log")
+	// The server zone is the machine's /etc/localtime otherwise; pin it so
+	// results match CI (UTC). A test that needs a zone uses withZone.
+	if _, err := os.Stat("/usr/share/zoneinfo/UTC"); err == nil {
+		LocaltimePath = "/usr/share/zoneinfo/UTC"
+	}
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -31,8 +36,22 @@ func withClock(t *testing.T, unix int64) {
 	t.Cleanup(func() { nowFunc = old })
 }
 
+// withZone points the server zone file at a system zoneinfo entry, so the
+// result does not depend on the machine running the tests (CI runs in UTC).
+func withZone(t *testing.T, name string) {
+	t.Helper()
+	p := filepath.Join("/usr/share/zoneinfo", name)
+	if _, err := os.Stat(p); err != nil {
+		t.Skipf("zoneinfo %s not available: %v", name, err)
+	}
+	old := LocaltimePath
+	LocaltimePath = p
+	t.Cleanup(func() { LocaltimePath = old })
+}
+
 func TestParityLogTimestamp(t *testing.T) {
 	loc := time.FixedZone("X", 3*3600)
+	withZone(t, "Europe/Istanbul") // UTC+3 all year since 2016
 	cases := map[time.Time]string{
 		time.Date(2026, 11, 5, 9, 3, 1, 0, loc):    "2026 Nov  5 09:03:01",
 		time.Date(2026, 11, 26, 0, 56, 49, 0, loc): "2026 Nov 26 00:56:49",
@@ -42,6 +61,11 @@ func TestParityLogTimestamp(t *testing.T) {
 		if got := parityLogTimestamp(in); got != want {
 			t.Errorf("%v: got %q want %q", in, got, want)
 		}
+	}
+	// The line is written in the server's zone, whatever zone the time came in.
+	withZone(t, "UTC")
+	if got, want := parityLogTimestamp(time.Date(2026, 11, 26, 0, 56, 49, 0, loc)), "2026 Nov 25 21:56:49"; got != want {
+		t.Errorf("UTC server: got %q want %q", got, want)
 	}
 }
 
